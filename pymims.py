@@ -1,5 +1,5 @@
 """
-pymims.py  v0.2.1
+pymims.py  v0.3
 ===============================================================================
 DEVELOPMENT STATUS: Early prototype — not a public package.
 This library is an original work in development and is NOT available on PyPI
@@ -8,9 +8,35 @@ or any public repository. Do not distribute without the author's permission.
 
 Authors   : G. McMahon (principal scientist) with AI-assisted development
 Created   : March 2026
-Updated   : April 2026 (v0.2.1 — robust Poly_list search; Colab support;
-                       ratio images with Poisson errors)
-Status    : v0.2.1 prototype
+Updated   : April 2026 (v0.3 — plane binning for low-count drift correction)
+Status    : v0.3 prototype
+
+Description
+-----------
+A Python library for reading and processing Cameca NanoSIMS .im files.
+The .im binary format was reverse-engineered from first principles — no
+Cameca documentation or OpenMIMS source code was used. The library is
+intended as a modern, version-stable alternative to the OpenMIMS ImageJ
+plugin, with no dependency on Java, ImageJ, or Fiji.
+
+Validated against:
+  - Cameca NanoSIMS 50/50L files from multiple instruments
+  - OpenMIMS reference outputs for drift correction and metadata
+
+v0.3 changes
+------------
+  - drift_correct() supports plane binning (bin_planes), needed for
+    high-spatial-resolution acquisitions where per-plane counts are too
+    low for reliable cross-correlation. Three apply modes: 'same' (default),
+    'interp' (linear between super-plane centres), 'super' (degrade stack
+    to super-plane resolution).
+
+v0.2 changes
+------------
+  - Works in both local scripts and Google Colab / Jupyter notebooks
+  - Ratio images with Poisson error propagation, delta notation, and masking
+  - Robust Poly_list search (handles headers with multiple Poly_list strings)
+  - plot() and plot_ratio() return the Figure for in-notebook display
 
 Description
 -----------
@@ -259,44 +285,136 @@ class MimsImage:
 
     # ── Drift correction ─────────────────────────────────────────────────────
 
-    def drift_correct(self, reference='SE', ref_plane=0):
+    def drift_correct(self, reference='SE', ref_plane=0,
+                      bin_planes=1, bin_apply='same'):
         """
-        Drift correct the stack using cross-correlation.
+        Drift correct the stack using FFT cross-correlation.
+
+        For high-spatial-resolution acquisitions where per-plane counts are
+        too low for reliable cross-correlation, use ``bin_planes`` to sum
+        adjacent planes into super-planes before computing shifts.
 
         Parameters
         ----------
         reference : str or int
-            Mass channel label (e.g. 'SE', '16O') or channel index to use
-            as the reference signal for cross-correlation.
+            Mass channel label (e.g. 'SE', '12C 14N') or channel index to use
+            as the reference signal for cross-correlation. Partial-match
+            (case-insensitive) on labels.
         ref_plane : int
-            Plane index to use as reference (default: 0 = first plane).
+            Plane index (or super-plane index, when binning) to use as
+            reference. Default 0 = first plane / first super-plane.
+        bin_planes : int
+            Group size for plane binning. 1 = no binning (default).
+            E.g. bin_planes=5 sums planes (0-4), (5-9), ... into super-planes
+            before cross-correlation. Must divide n_planes evenly, or any
+            trailing partial group is dropped from binning (a warning is
+            printed). Useful when individual planes have too few counts for
+            cross-correlation to be reliable.
+        bin_apply : {'same', 'interp', 'super'}
+            How shifts derived between super-planes are applied:
+              'same'   — every original plane in a group gets that group's
+                         shift (default; no false sub-group precision).
+              'interp' — shifts are linearly interpolated between super-plane
+                         centres and applied per original plane. Better when
+                         drift is monotonic.
+              'super'  — the corrected stack stays at the super-plane level.
+                         n_planes is reduced to the number of super-planes
+                         and counts are summed within groups. Useful as a
+                         degrade-to-fewer-planes preprocessing step.
         """
         # Resolve reference channel index
         ref_ch = self._resolve_channel(reference)
+        n_planes = self.metadata['n_planes']
+        n_masses = self.metadata['n_masses']
+        w = self.metadata['width']
 
-        print(f"Drift correcting using channel {ref_ch} ({self.masses[ref_ch]})...")
+        if bin_apply not in ('same', 'interp', 'super'):
+            raise ValueError(f"bin_apply must be 'same', 'interp', or 'super'; got {bin_apply!r}")
+        if bin_planes < 1:
+            raise ValueError(f"bin_planes must be >= 1; got {bin_planes}")
 
-        arr   = self.data.astype(float)
-        w     = self.metadata['width']
-        ref_img = arr[ref_plane, ref_ch]
+        arr = self.data.astype(float)
 
-        shifts = np.zeros((self.metadata['n_planes'], 2), dtype=int)
-        for p in range(self.metadata['n_planes']):
-            shifts[p] = self._xcorr_shift(ref_img, arr[p, ref_ch], w)
+        # Build super-planes (or use the original stack if bin_planes == 1)
+        if bin_planes == 1:
+            super_arr = arr
+            n_super   = n_planes
+            print(f"Drift correcting using channel {ref_ch} ({self.masses[ref_ch]})...")
+        else:
+            n_full_groups = n_planes // bin_planes
+            if n_full_groups < 2:
+                raise ValueError(
+                    f"bin_planes={bin_planes} gives only {n_full_groups} super-plane(s) "
+                    f"from {n_planes} planes — need at least 2 to drift correct."
+                )
+            kept = n_full_groups * bin_planes
+            if kept < n_planes:
+                print(f"  Warning: dropping {n_planes - kept} trailing plane(s) "
+                      f"that don't fill a complete bin of {bin_planes}.")
+            # Sum within groups: shape (n_super, masses, h, w)
+            super_arr = arr[:kept].reshape(
+                n_full_groups, bin_planes, n_masses,
+                self.metadata['height'], w
+            ).sum(axis=1)
+            n_super = n_full_groups
+            print(f"Drift correcting using channel {ref_ch} ({self.masses[ref_ch]}); "
+                  f"binning {bin_planes} planes -> {n_super} super-planes; "
+                  f"apply mode '{bin_apply}'.")
 
-        # Apply shifts to all channels
-        corrected = np.zeros_like(arr)
-        for p in range(self.metadata['n_planes']):
-            dy, dx = shifts[p]
-            for ch in range(self.metadata['n_masses']):
-                corrected[p, ch] = nd_shift(
-                    arr[p, ch], (dy, dx), mode='constant', cval=0)
+        # Compute shifts on super-planes
+        ref_img = super_arr[ref_plane, ref_ch]
+        super_shifts = np.zeros((n_super, 2), dtype=int)
+        for p in range(n_super):
+            super_shifts[p] = self._xcorr_shift(ref_img, super_arr[p, ref_ch], w)
 
-        self.corrected = corrected.astype(np.float32)
-        self.shifts    = shifts
+        # Branch on apply mode
+        if bin_apply == 'super':
+            # Operate on super-planes directly; reduce n_planes
+            corrected = np.zeros_like(super_arr)
+            for p in range(n_super):
+                dy, dx = super_shifts[p]
+                for ch in range(n_masses):
+                    corrected[p, ch] = nd_shift(
+                        super_arr[p, ch], (dy, dx), mode='constant', cval=0)
+            self.corrected = corrected.astype(np.float32)
+            self.shifts    = super_shifts
+            self.metadata['n_planes_original'] = n_planes
+            self.metadata['n_planes']          = n_super
+            self.metadata['bin_planes']        = bin_planes
+            self.metadata['bin_apply']         = bin_apply
 
-        dy_range = shifts[:, 0].min(), shifts[:, 0].max()
-        dx_range = shifts[:, 1].min(), shifts[:, 1].max()
+        else:
+            # Build a per-plane shift array for the original stack
+            plane_shifts = np.zeros((n_planes, 2), dtype=int)
+
+            if bin_planes == 1 or bin_apply == 'same':
+                # Each original plane gets its group's shift
+                for p in range(n_planes):
+                    g = min(p // bin_planes, n_super - 1)
+                    plane_shifts[p] = super_shifts[g]
+
+            else:  # 'interp'
+                # Super-plane g has centre at original plane g*bin_planes + (bin_planes-1)/2
+                centres = np.arange(n_super) * bin_planes + (bin_planes - 1) / 2.0
+                for p in range(n_planes):
+                    dy = float(np.interp(p, centres, super_shifts[:, 0]))
+                    dx = float(np.interp(p, centres, super_shifts[:, 1]))
+                    plane_shifts[p] = (int(round(dy)), int(round(dx)))
+
+            corrected = np.zeros_like(arr)
+            for p in range(n_planes):
+                dy, dx = plane_shifts[p]
+                for ch in range(n_masses):
+                    corrected[p, ch] = nd_shift(
+                        arr[p, ch], (dy, dx), mode='constant', cval=0)
+
+            self.corrected = corrected.astype(np.float32)
+            self.shifts    = plane_shifts
+            self.metadata['bin_planes'] = bin_planes
+            self.metadata['bin_apply']  = bin_apply
+
+        dy_range = self.shifts[:, 0].min(), self.shifts[:, 0].max()
+        dx_range = self.shifts[:, 1].min(), self.shifts[:, 1].max()
         print(f"  Done. Y shifts: {dy_range[0]:+d} to {dy_range[1]:+d} px  |  "
               f"X shifts: {dx_range[0]:+d} to {dx_range[1]:+d} px")
 

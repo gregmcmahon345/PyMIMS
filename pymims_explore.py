@@ -170,10 +170,13 @@ def explore(img):
         )
 
     masses = img.masses
+    # Build dropdown options as (display_label, value) tuples — ipywidgets
+    # expects this order. Value is the channel index.
+    channel_options = [(f"[{i}] {lab}", i) for i, lab in enumerate(masses)]
 
     # ── Drift correction controls ───────────────────────────────────────────
     drift_ref = W.Dropdown(
-        options=list(enumerate(masses)),
+        options=channel_options,
         value=0,
         description='Drift ref:',
         style={'description_width': 'initial'},
@@ -193,10 +196,10 @@ def explore(img):
                             button_style='warning')
 
     # ── Ratio controls ──────────────────────────────────────────────────────
-    num_dd = W.Dropdown(options=list(enumerate(masses)), value=0,
+    num_dd = W.Dropdown(options=channel_options, value=0,
                         description='Numerator:',
                         style={'description_width': 'initial'})
-    den_dd = W.Dropdown(options=list(enumerate(masses)),
+    den_dd = W.Dropdown(options=channel_options,
                         value=min(1, len(masses) - 1),
                         description='Denominator:',
                         style={'description_width': 'initial'})

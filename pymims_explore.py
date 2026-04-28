@@ -257,7 +257,13 @@ def explore(img):
                     delta_ref=delta_ref,
                     min_counts=min_counts.value if min_counts.value > 0 else None,
                     max_rel_err=max_rel.value if max_rel.value > 0 else None,
+                    outpath=None,    # don't auto-save in widget mode
+                    show=True,       # keep figure open for display
                 )
+                # Explicit display — Output() widget context doesn't auto-render
+                display(fig)
+                import matplotlib.pyplot as plt
+                plt.close(fig)       # free after explicit display
                 print(bulk_ratio_report(result, delta_ref=delta_ref))
             except Exception as e:
                 import traceback

@@ -96,14 +96,20 @@ from scipy.ndimage import shift as nd_shift
 # ── Environment detection ────────────────────────────────────────────────────
 
 def _in_notebook():
-    """Return True if running inside a Jupyter / Colab / IPython notebook."""
+    """Return True if running inside a Jupyter / Colab / IPython notebook.
+
+    Detection strategy: any IPython kernel that is NOT the terminal CLI is
+    treated as a notebook. Covers Jupyter (ZMQInteractiveShell), Colab
+    (which uses its own subclass), VS Code notebooks, etc.
+    """
     try:
         from IPython import get_ipython
         shell = get_ipython()
         if shell is None:
             return False
-        # ZMQInteractiveShell == Jupyter/Colab; TerminalInteractiveShell == ipython CLI
-        return shell.__class__.__name__ == 'ZMQInteractiveShell'
+        # Anything except plain terminal IPython is a notebook-like environment
+        # where inline display works.
+        return shell.__class__.__name__ != 'TerminalInteractiveShell'
     except Exception:
         return False
 
@@ -737,8 +743,11 @@ class MimsImage:
             base    = os.path.splitext(os.path.basename(self.path))[0]
             num     = self._resolve_channel(numerator)
             den     = self._resolve_channel(denominator)
-            tag     = f"{self.masses[num]}_over_{self.masses[den]}".replace('/', '_')
-            outpath = os.path.join(os.getcwd(), f"{base}_ratio_{tag}.png")
+            # Sanitize channel labels for filename use: replace spaces, slashes
+            num_safe = self.masses[num].replace(' ', '').replace('/', '_')
+            den_safe = self.masses[den].replace(' ', '').replace('/', '_')
+            tag      = f"{num_safe}_over_{den_safe}"
+            outpath  = os.path.join(os.getcwd(), f"{base}_ratio_{tag}.png")
 
         result = self.ratio(numerator, denominator, corrected=corrected,
                             min_counts=min_counts, max_rel_err=max_rel_err)

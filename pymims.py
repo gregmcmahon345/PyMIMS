@@ -1,5 +1,5 @@
 """
-pymims.py  v0.2
+pymims.py  v0.2.1
 ===============================================================================
 DEVELOPMENT STATUS: Early prototype — not a public package.
 This library is an original work in development and is NOT available on PyPI
@@ -8,8 +8,9 @@ or any public repository. Do not distribute without the author's permission.
 
 Authors   : G. McMahon (principal scientist) with AI-assisted development
 Created   : March 2026
-Updated   : April 2026 (v0.2 — Colab support, ratio images with Poisson errors)
-Status    : v0.2 prototype
+Updated   : April 2026 (v0.2.1 — robust Poly_list search; Colab support;
+                       ratio images with Poisson errors)
+Status    : v0.2.1 prototype
 
 Description
 -----------
@@ -175,13 +176,35 @@ class MimsImage:
         m['date']         = _str(data, 0x5c, 12)
         m['time']         = _str(data, 0x6c, 8)
 
-        # Image dimensions from Poly_list block
-        poly_off = data.find(b'Poly_list')
-        if poly_off >= 0:
-            m['width']  = _u32(data, poly_off + 0x34)
-            m['height'] = _u32(data, poly_off + 0x38)
-        else:
-            raise ValueError("Could not find Poly_list block — file may be corrupt")
+        # Image dimensions from Poly_list block.
+        # The string 'Poly_list' can appear multiple times in the header
+        # (e.g. as part of longer label strings). Walk through all occurrences
+        # and pick the first one where +0x34 and +0x38 yield plausible image
+        # dimensions. NanoSIMS images are typically 64–1024 px square; we
+        # accept 16–8192 to be safe.
+        m['width']  = None
+        m['height'] = None
+        search_from = 0
+        while True:
+            poly_off = data.find(b'Poly_list', search_from)
+            if poly_off < 0:
+                break
+            if poly_off + 0x3c > len(data):
+                break
+            w_try = _u32(data, poly_off + 0x34)
+            h_try = _u32(data, poly_off + 0x38)
+            if 16 <= w_try <= 8192 and 16 <= h_try <= 8192:
+                m['width']      = w_try
+                m['height']     = h_try
+                m['poly_offset'] = poly_off
+                break
+            search_from = poly_off + 1
+
+        if m['width'] is None:
+            raise ValueError(
+                "Could not find a Poly_list block with valid image dimensions "
+                "— file may be corrupt or use an unsupported header layout"
+            )
 
         # Raster (nm) at fixed offset -68 before data block
         m['raster_nm']  = _u32(data, m['data_offset'] - 68)

@@ -214,11 +214,17 @@ def explore(img):
                           style={'description_width': 'initial'})
     plot_button = W.Button(description='Plot ratio', button_style='success')
 
-    out = W.Output()
+    # Three output panels:
+    # - status: drift correction messages, errors
+    # - channels_out: the all-channels plot (pinned, only changes on demand)
+    # - ratio_out: the four-panel ratio figure (changes every Plot ratio)
+    status_out   = W.Output()
+    channels_out = W.Output()
+    ratio_out    = W.Output()
 
     # ── Callbacks ───────────────────────────────────────────────────────────
     def do_drift(_):
-        with out:
+        with status_out:
             clear_output(wait=True)
             try:
                 img.drift_correct(
@@ -230,7 +236,7 @@ def explore(img):
                 print(f"Drift correction failed: {e}")
 
     def do_channels(_):
-        with out:
+        with channels_out:
             clear_output(wait=True)
             try:
                 fig = img.plot(outpath=None, show=True)
@@ -242,7 +248,7 @@ def explore(img):
                 traceback.print_exc()
 
     def do_plot(_):
-        with out:
+        with ratio_out:
             clear_output(wait=True)
             try:
                 num = num_dd.value
@@ -271,13 +277,12 @@ def explore(img):
                     delta_ref=delta_ref,
                     min_counts=min_counts.value if min_counts.value > 0 else None,
                     max_rel_err=max_rel.value if max_rel.value > 0 else None,
-                    outpath=None,    # don't auto-save in widget mode
-                    show=True,       # keep figure open for display
+                    outpath=None,
+                    show=True,
                 )
-                # Explicit display — Output() widget context doesn't auto-render
                 display(fig)
                 import matplotlib.pyplot as plt
-                plt.close(fig)       # free after explicit display
+                plt.close(fig)
                 print(bulk_ratio_report(result, delta_ref=delta_ref))
             except Exception as e:
                 import traceback
@@ -298,4 +303,6 @@ def explore(img):
     ])
 
     display(W.HBox([drift_box, ratio_box]))
-    display(out)
+    display(status_out)
+    display(channels_out)
+    display(ratio_out)

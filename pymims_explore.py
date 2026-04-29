@@ -194,6 +194,8 @@ def explore(img):
     )
     drift_button = W.Button(description='Re-do drift correction',
                             button_style='warning')
+    channels_button = W.Button(description='Show channels',
+                               button_style='info')
 
     # ── Ratio controls ──────────────────────────────────────────────────────
     num_dd = W.Dropdown(options=channel_options, value=0,
@@ -226,6 +228,18 @@ def explore(img):
                 )
             except Exception as e:
                 print(f"Drift correction failed: {e}")
+
+    def do_channels(_):
+        with out:
+            clear_output(wait=True)
+            try:
+                fig = img.plot(outpath=None, show=True)
+                display(fig)
+                import matplotlib.pyplot as plt
+                plt.close(fig)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
 
     def do_plot(_):
         with out:
@@ -270,11 +284,13 @@ def explore(img):
                 traceback.print_exc()
 
     drift_button.on_click(do_drift)
+    channels_button.on_click(do_channels)
     plot_button.on_click(do_plot)
 
     drift_box = W.VBox([
         W.HTML("<b>Drift correction</b>"),
-        drift_ref, bin_planes, bin_apply, drift_button,
+        drift_ref, bin_planes, bin_apply,
+        W.HBox([drift_button, channels_button]),
     ])
     ratio_box = W.VBox([
         W.HTML("<b>Ratio</b>"),

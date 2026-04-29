@@ -1,5 +1,5 @@
 """
-pymims.py  v0.3
+pymims.py  v0.3.1
 ===============================================================================
 DEVELOPMENT STATUS: Early prototype — not a public package.
 This library is an original work in development and is NOT available on PyPI
@@ -8,8 +8,8 @@ or any public repository. Do not distribute without the author's permission.
 
 Authors   : G. McMahon (principal scientist) with AI-assisted development
 Created   : March 2026
-Updated   : April 2026 (v0.3 — plane binning for low-count drift correction)
-Status    : v0.3 prototype
+Updated   : April 2026 (v0.3.1 — display refinements, σ/R cap, valid% fix)
+Status    : v0.3.1 prototype
 
 Description
 -----------
@@ -787,6 +787,12 @@ class MimsImage:
         r_lo, r_hi   = _prange(R)
         s_lo, s_hi   = _prange(sigma)
         re_lo, re_hi = _prange(rel_err)
+        # Cap rel_err display at 1.0 (100% relative error) — anything above
+        # is noise-dominated and would otherwise drown out real signal.
+        # The underlying result['rel_err'] is unchanged.
+        re_hi = min(re_hi, 1.0)
+        if re_lo >= re_hi:
+            re_lo = 0.0
 
         # Figure
         bg       = '#1a1a1a'
@@ -837,8 +843,11 @@ class MimsImage:
 
         # Title with masking info
         n_total  = R.size
-        n_valid  = int(np.isfinite(R).sum())
-        pct_kept = 100.0 * n_valid / n_total if n_total else 0
+        n_finite = int(np.isfinite(R).sum())
+        # "Useful" pixels: finite ratio with rel_err under 100% (not noise-dominated)
+        n_useful = int((np.isfinite(R) & np.isfinite(rel_err) & (rel_err < 1.0)).sum())
+        pct_finite = 100.0 * n_finite / n_total if n_total else 0
+        pct_useful = 100.0 * n_useful / n_total if n_total else 0
         mask_bits = []
         if min_counts is not None:  mask_bits.append(f'B≥{min_counts:g}')
         if max_rel_err is not None: mask_bits.append(f'σ/R≤{max_rel_err:g}')
@@ -847,7 +856,8 @@ class MimsImage:
         title = (f"{os.path.basename(self.path)}  |  "
                  f"ratio {num_lab}/{den_lab}  |  "
                  f"{result['n_planes']} planes summed  |  "
-                 f"valid: {pct_kept:.1f}%  |  {mask_str}")
+                 f"finite: {pct_finite:.1f}%, σ/R<1: {pct_useful:.1f}%  |  "
+                 f"{mask_str}")
         fig.suptitle(title, color='white', fontsize=10, y=1.02)
         plt.tight_layout()
 

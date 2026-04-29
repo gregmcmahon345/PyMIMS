@@ -103,6 +103,15 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
       'aics'               : array of AIC values (length k_max)
       'best_k_bic'         : int, k with lowest BIC
       'best_k_aic'         : int, k with lowest AIC
+      'sensible_k'         : int, conservative-consensus pick from elbow
+                              heuristics (largest-drop ∩ kneedle); favoured
+                              over best_k_bic when ΔBIC has a long shallow
+                              plateau (the "BIC overfitting" failure mode).
+      'largest_drop_k'     : int, pick from the largest-ΔBIC-drop heuristic
+      'kneedle_k'          : int, pick from the kneedle algorithm
+      'heuristics_agree'   : bool, whether the two elbow methods agreed.
+                              Disagreement is itself a useful signal —
+                              eyeball the side-by-side panels.
       'thresholds_by_k'    : dict {k -> list of crossing-point thresholds}
                               (linear units, NOT log; one entry per k)
       'empirical_quantiles': dict {percentile -> count value}
@@ -171,6 +180,10 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
             'aics': np.array([]),
             'best_k_bic': None,
             'best_k_aic': None,
+            'sensible_k': None,
+            'largest_drop_k': None,
+            'kneedle_k': None,
+            'heuristics_agree': None,
             'thresholds_by_k': {},
             'empirical_quantiles': empirical_quantiles,
             'components_by_k': {},
@@ -204,6 +217,7 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
 
     bics = np.asarray(bics)
     aics = np.asarray(aics)
+    elbow = _sensible_k(bics, k_max)
 
     return {
         'log_values': log_v.ravel(),
@@ -215,6 +229,10 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
         'aics': aics,
         'best_k_bic': int(np.argmin(bics)) + 1,
         'best_k_aic': int(np.argmin(aics)) + 1,
+        'sensible_k'      : elbow['sensible_k'],
+        'largest_drop_k'  : elbow['largest_drop_k'],
+        'kneedle_k'       : elbow['kneedle_k'],
+        'heuristics_agree': elbow['heuristics_agree'],
         'thresholds_by_k': thresholds_by_k,
         'empirical_quantiles': empirical_quantiles,
         'components_by_k': components_by_k,
@@ -314,6 +332,110 @@ def _component_summaries(gm):
     return summaries
 
 
+# ── Elbow / "sensible_k" heuristics ──────────────────────────────────────────
+
+def _elbow_largest_drop(bics):
+    """
+    'Largest drop' elbow: pick k where the next ΔBIC drop becomes small.
+
+    Looks at the first differences of BIC (bics[k+1] - bics[k]) — these are
+    negative when adding a component improves the fit. Picks k+1 where the
+    drop is largest, on the principle that the dominant elbow is where
+    further components start adding marginal value.
+
+    Returns the chosen k (1-indexed). If only one or two values exist,
+    returns the index of the minimum.
+    """
+    bics = np.asarray(bics, dtype=float)
+    if bics.size < 2:
+        return int(np.argmin(bics)) + 1
+    drops = np.diff(bics)               # bics[k+1] - bics[k]; negative = improvement
+    most_improving = int(np.argmin(drops))   # the largest negative
+    return most_improving + 2            # +1 for 0-index, +1 because diff shifts
+
+
+def _elbow_kneedle(bics, k_values=None):
+    """
+    Kneedle elbow detection (Satopää 2011) on the BIC curve.
+
+    Uses the `kneed` package if available; otherwise falls back to a
+    minimal in-house implementation that finds the maximum perpendicular
+    distance from the line connecting the first and last points.
+
+    Returns the chosen k (1-indexed), or None if a knee cannot be found.
+    """
+    bics = np.asarray(bics, dtype=float)
+    if bics.size < 3:
+        return int(np.argmin(bics)) + 1   # too short to find a knee
+    if k_values is None:
+        k_values = np.arange(1, bics.size + 1)
+
+    # Try the kneed library first (proper kneedle algorithm)
+    try:
+        from kneed import KneeLocator
+        # BIC decreases (mostly) then plateaus → curve='convex', direction='decreasing'
+        kl = KneeLocator(k_values, bics, curve='convex',
+                         direction='decreasing', S=1.0)
+        if kl.knee is not None:
+            return int(kl.knee)
+    except ImportError:
+        pass   # fall through to in-house version
+    except Exception:
+        pass
+
+    # Fallback: maximum perpendicular distance from the chord connecting
+    # the first and last points. Robust, parameter-free, and doesn't need
+    # any external library.
+    x = k_values.astype(float)
+    y = bics
+    # Normalise both axes to [0, 1] so the distance is geometrically
+    # comparable.
+    if x.max() == x.min() or y.max() == y.min():
+        return int(np.argmin(bics)) + 1
+    xn = (x - x.min()) / (x.max() - x.min())
+    yn = (y - y.min()) / (y.max() - y.min())
+    # Vector from first to last
+    p1 = np.array([xn[0], yn[0]])
+    p2 = np.array([xn[-1], yn[-1]])
+    line = p2 - p1
+    line_norm = line / (np.linalg.norm(line) + 1e-12)
+    # Perpendicular distance for each point
+    points = np.column_stack([xn, yn]) - p1
+    proj = points @ line_norm
+    proj_vec = np.outer(proj, line_norm)
+    perp = points - proj_vec
+    dists = np.linalg.norm(perp, axis=1)
+    return int(k_values[np.argmax(dists)])
+
+
+def _sensible_k(bics, k_max):
+    """
+    Combine largest-drop and kneedle elbow heuristics into a single
+    'sensible_k' recommendation.
+
+    Returns
+    -------
+    dict with:
+      'sensible_k'      : int — consensus pick (smaller of the two when they
+                                disagree, on the conservative principle that
+                                fewer components is safer)
+      'largest_drop_k'  : int — pick from the largest-drop heuristic
+      'kneedle_k'       : int — pick from the kneedle algorithm
+      'heuristics_agree': bool — True iff the two methods picked the same k
+    """
+    k_values = np.arange(1, len(bics) + 1)
+    drop_k = _elbow_largest_drop(bics)
+    knee_k = _elbow_kneedle(bics, k_values)
+    agree = (drop_k == knee_k)
+    consensus = min(drop_k, knee_k)   # conservative consensus
+    return {
+        'sensible_k'      : consensus,
+        'largest_drop_k'  : drop_k,
+        'kneedle_k'       : knee_k,
+        'heuristics_agree': agree,
+    }
+
+
 # ── Plotting ─────────────────────────────────────────────────────────────────
 
 def plot_histograms(img, channel=None, k_max=6, n_bins=80,
@@ -398,6 +520,7 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
         bics = fit['bics']
         aics = fit['aics']
         best_k = fit['best_k_bic']
+        sensible = fit['sensible_k']
 
         # Clip the visible range to avoid a few extreme outliers stretching
         # the axis and squashing the bulk distribution into a sliver. The
@@ -449,11 +572,19 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
                     ax.axvline(lt, color='red', linewidth=0.8,
                                linestyle=':', alpha=0.7)
 
-            # Title with k and BIC. Highlight best_k.
-            star = ' ★' if k == best_k else ''
-            ax.set_title(f'k = {k}{star}\nBIC = {bics[k-1]:.0f}',
-                         fontsize=9,
-                         color='darkred' if k == best_k else 'black')
+            # Title with k and BIC. ★ = min-BIC pick, ◆ = sensible_k pick
+            # (both shown when they disagree).
+            markers = ''
+            if k == best_k: markers += ' ★'
+            if k == sensible and sensible != best_k: markers += ' ◆'
+            elif k == sensible and sensible == best_k: markers = ' ★◆'
+            title_color = 'black'
+            if k == sensible:
+                title_color = 'darkgreen'        # sensible pick is the recommended one
+            elif k == best_k:
+                title_color = 'darkred'          # BIC pick (when sensible disagrees)
+            ax.set_title(f'k = {k}{markers}\nBIC = {bics[k-1]:.0f}',
+                         fontsize=9, color=title_color)
             ax.set_xlim(x_lo, x_hi)
             ax.set_yticks([])
             # Show useful x-tick positions on the bottom row only
@@ -481,12 +612,26 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
         ax.plot(ks, d_aic, 's--', color='darkorange', label='ΔAIC',
                 linewidth=1.0, alpha=0.8)
         ax.axhline(10, color='gray', linewidth=0.6, linestyle=':')
-        ax.axvline(best_k, color='darkred', linewidth=0.8, alpha=0.6)
+        # Mark BIC pick (red) and sensible_k pick (green). When they agree,
+        # only one line is visible.
+        if best_k != sensible:
+            ax.axvline(best_k, color='darkred', linewidth=0.8, alpha=0.6,
+                       label=f'BIC k={best_k}')
+            ax.axvline(sensible, color='darkgreen', linewidth=1.2, alpha=0.8,
+                       label=f'sensible k={sensible}')
+        else:
+            ax.axvline(best_k, color='darkgreen', linewidth=1.2, alpha=0.8,
+                       label=f'k={best_k}')
         ax.set_xlabel('k', fontsize=8)
         ax.set_ylabel('Δ from best', fontsize=8)
-        ax.set_title(f'best k = {best_k}', fontsize=9, color='darkred')
+        if best_k == sensible:
+            title_str = f'k = {best_k}'
+        else:
+            title_str = f'BIC k={best_k}  →  use k={sensible}'
+        ax.set_title(title_str, fontsize=9,
+                     color='darkgreen' if best_k == sensible else 'darkred')
         ax.tick_params(labelsize=7)
-        ax.legend(fontsize=7, loc='upper right', frameon=False)
+        ax.legend(fontsize=6, loc='upper right', frameon=False)
         for spine in ('top', 'right'):
             ax.spines[spine].set_visible(False)
 
@@ -496,7 +641,8 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
 
     fig.suptitle(
         f'Pixel-intensity histograms with GMM candidates  '
-        f'(red dotted lines = crossing-point thresholds; ★ = min-BIC)',
+        f'(red dotted lines = crossing thresholds; ★ = min-BIC; '
+        f'◆ = sensible_k recommendation)',
         fontsize=10, y=1.0,
     )
     fig.tight_layout()
@@ -525,32 +671,46 @@ def _print_summary(results):
             continue
         bics = fit['bics']
         d_bic = bics - bics.min()
-        best = fit['best_k_bic']
+        bic_k = fit['best_k_bic']
+        sensible = fit['sensible_k']
+        drop_k = fit['largest_drop_k']
+        knee_k = fit['kneedle_k']
+        agree = fit['heuristics_agree']
         zero_pct = fit['frac_zeros'] * 100.0
         n_used = fit.get('n_pixels_used', '?')
-        print(f'  {label}   best k={best}  '
-              f'zero pixels: {zero_pct:.1f}%   '
-              f'pixels in fit: {n_used}')
+
+        # Summary line: highlight when sensible_k disagrees with BIC
+        if bic_k == sensible:
+            k_msg = f'k={sensible}  (BIC and elbow agree)'
+        else:
+            k_msg = (f'k={sensible}  (recommended; BIC says {bic_k}, '
+                     f'largest-drop says {drop_k}, kneedle says {knee_k})')
+        print(f'  {label}   {k_msg}   '
+              f'zero pixels: {zero_pct:.1f}%   pixels in fit: {n_used}')
+
         # ΔBIC table
         bic_str = '    ΔBIC: ' + '  '.join(
             f'k={k}:{d:.0f}' for k, d in zip(range(1, len(bics) + 1), d_bic)
         )
         print(bic_str)
-        # Crossing-point thresholds for the best k
-        thrs = fit['thresholds_by_k'][best]
+
+        # Crossing-point thresholds at sensible_k
+        thrs = fit['thresholds_by_k'][sensible]
         if thrs:
             thr_str = ', '.join(f'{t:.1f}' for t in thrs)
-            print(f'    GMM crossings (counts) at best k: {thr_str}')
-        # Empirical quantiles (acquisition-invariant percentile cutoffs)
+            print(f'    GMM crossings (counts) at k={sensible}: {thr_str}')
+
+        # Empirical quantiles
         eq = fit['empirical_quantiles']
         eq_str = '    Empirical quantiles (counts):  ' + '  '.join(
             f'p{p}={v:.1f}' for p, v in eq.items()
         )
         print(eq_str)
-        # Per-component breakdown at best k
-        comps = fit['components_by_k'].get(best, [])
+
+        # Per-component breakdown at sensible_k (the recommended pick)
+        comps = fit['components_by_k'].get(sensible, [])
         if comps:
-            print(f'    Components at k={best} (sorted by mean):')
+            print(f'    Components at k={sensible} (sorted by mean):')
             print(f'      {"#":>2} {"weight":>7} {"mean":>10} '
                   f'{"p5":>9} {"p50":>9} {"p95":>9}')
             for i, c in enumerate(comps):
@@ -558,12 +718,19 @@ def _print_summary(results):
                 print(f'      {i:>2} {c["weight"]:>7.1%} '
                       f'{c["mean_counts"]:>10.2f} '
                       f'{q[5]:>9.2f} {q[50]:>9.2f} {q[95]:>9.2f}')
+
+        # If BIC disagrees, also briefly show what BIC's pick would have given
+        if bic_k != sensible:
+            bic_thrs = fit['thresholds_by_k'][bic_k]
+            if bic_thrs:
+                bic_thr_str = ', '.join(f'{t:.1f}' for t in bic_thrs)
+                print(f'    (For reference: BIC k={bic_k} crossings: {bic_thr_str})')
         print()
 
 
 # ── Convenience: a single best-fit threshold table ──────────────────────────
 
-def best_thresholds(results, criterion='bic', manual_k=None):
+def best_thresholds(results, criterion='sensible', manual_k=None):
     """
     Reduce a plot_histograms() result dict to a flat
     {channel_label: list_of_thresholds} mapping.
@@ -572,19 +739,35 @@ def best_thresholds(results, criterion='bic', manual_k=None):
     ----------
     results : dict
         Output of plot_histograms().
-    criterion : 'bic' or 'aic'
+    criterion : 'sensible' (default), 'bic', or 'aic'
         Which criterion picks the default best k for each channel.
+        'sensible' = elbow-based recommendation (largest_drop ∩ kneedle),
+                     conservative consensus when they disagree. This is the
+                     default because BIC tends to overfit on long shallow
+                     plateaus where adding components only marginally
+                     improves likelihood.
+        'bic'      = global BIC minimum (legacy behaviour).
+        'aic'      = global AIC minimum.
     manual_k : dict or None
         Per-channel override, e.g. {'31P': 3, '12C 15N': 2}. Channels not
-        in the dict fall back to the criterion-selected best_k. Use this
-        after eyeballing the side-by-side panels to override the BIC verdict
-        on channels where it overfits.
+        in the dict fall back to the criterion-selected k. Use this after
+        eyeballing the side-by-side panels to override on channels where
+        you disagree with the heuristic.
 
     Returns
     -------
     dict {channel_label: list_of_thresholds_in_counts}
     """
-    key = 'best_k_bic' if criterion == 'bic' else 'best_k_aic'
+    if criterion == 'sensible':
+        key = 'sensible_k'
+    elif criterion == 'bic':
+        key = 'best_k_bic'
+    elif criterion == 'aic':
+        key = 'best_k_aic'
+    else:
+        raise ValueError(
+            f"criterion must be 'sensible', 'bic', or 'aic'; got {criterion!r}"
+        )
     manual_k = manual_k or {}
     out = {}
     for label, fit in results.items():

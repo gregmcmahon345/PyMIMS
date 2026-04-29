@@ -280,10 +280,6 @@ def explore(img):
         style={'description_width': 'initial'},
         layout=W.Layout(width='180px'),
     )
-    hsi_contour = W.Checkbox(
-        value=False, description='nat. abund. contour',
-        indent=False,
-    )
     hsi_button = W.Button(description='Plot HSI', button_style='primary',
                           layout=BTN_LAYOUT)
 
@@ -394,16 +390,6 @@ def explore(img):
                 rmax = _parse_optional_float(hsi_ratio_max.value)
                 sf = hsi_scale_factor.value if hsi_scale_factor.value > 0 else 1.0
 
-                contour = hsi_contour.value
-                if contour and (min_counts.value is None or min_counts.value <= 0):
-                    print("Contour requires a min_counts mask — set min_counts > 0 "
-                          "in the Ratio panel above, or untick the contour checkbox.")
-                    return
-                if contour and nat_abund is None:
-                    print(f"No known natural-abundance reference for "
-                          f"{num_lab}/{den_lab} — contour disabled for this pair.")
-                    contour = False
-
                 ref_msg = (f'  |  nat. abund.: {nat_abund:.4g} ({nat_key})'
                            if nat_abund is not None else '')
                 scale_msg = f'  |  ×{sf:g}' if sf != 1.0 else ''
@@ -420,7 +406,6 @@ def explore(img):
                     scale_factor=sf,
                     natural_abundance=nat_abund,
                     show_natural_abundance=True,
-                    contour_natural_abundance=contour,
                     outpath=None,
                     show=True,
                 )
@@ -570,14 +555,6 @@ def explore(img):
                     rmax = _parse_optional_float(hsi_ratio_max.value)
                     sf = (hsi_scale_factor.value
                           if hsi_scale_factor.value > 0 else 1.0)
-                    contour = hsi_contour.value
-                    if contour and (min_counts.value is None
-                                    or min_counts.value <= 0):
-                        print("Contour requires min_counts > 0; "
-                              "exporting HSI without contour.")
-                        contour = False
-                    if contour and nat_abund is None:
-                        contour = False
                     spec = {
                         'kind': 'hsi',
                         'numerator': num, 'denominator': den,
@@ -588,7 +565,6 @@ def explore(img):
                         'scale_factor': sf,
                         'natural_abundance': nat_abund,
                         'show_natural_abundance': True,
-                        'contour_natural_abundance': contour,
                         'min_counts': min_counts.value if min_counts.value > 0 else None,
                     }
                     jobs.append((f'hsi_{pair_tag}',
@@ -657,7 +633,7 @@ def explore(img):
     hsi_box = W.VBox([
         W.HTML("<b>HSI</b> <small>(uses Numerator / Denominator from Ratio panel)</small>"),
         hsi_intensity, hsi_cmap, hsi_cmap_reverse,
-        hsi_scale_factor, hsi_ratio_min, hsi_ratio_max, hsi_contour,
+        hsi_scale_factor, hsi_ratio_min, hsi_ratio_max,
         hsi_button,
     ])
 

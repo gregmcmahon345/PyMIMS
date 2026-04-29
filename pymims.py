@@ -896,7 +896,6 @@ class MimsImage:
                  scale_factor=1.0,
                  natural_abundance=None,
                  show_natural_abundance=True,
-                 contour_natural_abundance=False,
                  intensity_percentile=(1, 99.5),
                  min_counts=None,
                  scalebar_color='white',
@@ -948,19 +947,12 @@ class MimsImage:
         natural_abundance : float or None
             Reference natural-abundance ratio in *unscaled* units (i.e.
             0.0037 for ¹⁵N/¹⁴N, regardless of scale_factor). Used by
-            show_natural_abundance and contour_natural_abundance. Caller is
-            responsible for supplying this; the library does not infer it
-            from labels.
+            show_natural_abundance. Caller is responsible for supplying
+            this; the library does not infer it from labels.
         show_natural_abundance : bool
             If True (default) and natural_abundance is provided, mark the
             natural-abundance value on the colorbar as a horizontal tick +
             label.
-        contour_natural_abundance : bool
-            If True and natural_abundance and min_counts are both provided,
-            draw a thin contour line on the image at ratio = natural_abundance.
-            Pixels below min_counts are excluded from the contour (the mask
-            constraint avoids chaotic squiggles in low-count regions).
-            Raises ValueError if enabled without min_counts.
         intensity_percentile : (lo, hi)
             Percentile clip for the intensity normalisation (default 1, 99.5).
         min_counts : float or None
@@ -976,18 +968,6 @@ class MimsImage:
             fig  : matplotlib Figure
             info : dict with ratio, intensity, mask, ratio_range, cmap_name
         """
-        # Validate contour-line constraint up-front
-        if contour_natural_abundance:
-            if natural_abundance is None:
-                raise ValueError(
-                    "contour_natural_abundance=True requires natural_abundance "
-                    "to be specified."
-                )
-            if min_counts is None:
-                raise ValueError(
-                    "contour_natural_abundance=True requires min_counts to be "
-                    "set, to avoid noisy contour squiggles in low-count regions."
-                )
         # Map our cmap aliases
         cmap_alias = {
             'rainbow'         : 'hsv',
@@ -1163,21 +1143,6 @@ class MimsImage:
                 ha='left', va='center',
             )
             nat_tick_drawn = True
-
-        # Optional contour line on the image at natural abundance
-        if contour_natural_abundance and natural_abundance is not None:
-            # Restrict the contour source to the masked region; outside the
-            # mask we set NaN so contour() ignores those pixels.
-            R_for_contour = np.where(mask, R, np.nan)
-            try:
-                ax.contour(R_for_contour,
-                           levels=[natural_abundance],
-                           extent=[0, field_um, field_um, 0],
-                           colors='white', linewidths=0.7, alpha=0.8)
-            except Exception:
-                # contour can fail if the level lies entirely outside the
-                # finite range of the masked array — that's fine, just skip.
-                pass
 
         # Title (kept compact for the smaller figure)
         title = (f"HSI {num_lab}/{den_lab}  |  "
@@ -1381,7 +1346,6 @@ class MimsImage:
                           scale_factor=1.0,
                           natural_abundance=None,
                           show_natural_abundance=True,
-                          contour_natural_abundance=False,
                           intensity_percentile=(1, 99.5),
                           min_counts=None, scalebar_color='white',
                           fontsize=9, title=None):
@@ -1392,16 +1356,6 @@ class MimsImage:
         """
         from matplotlib.colors import Normalize
         from matplotlib.cm import ScalarMappable
-
-        if contour_natural_abundance:
-            if natural_abundance is None:
-                raise ValueError(
-                    "contour_natural_abundance=True requires natural_abundance."
-                )
-            if min_counts is None:
-                raise ValueError(
-                    "contour_natural_abundance=True requires min_counts."
-                )
 
         cmap_alias = {
             'rainbow': 'hsv',
@@ -1479,17 +1433,6 @@ class MimsImage:
         ax.set_facecolor('#1a1a1a')
         ax.axis('off')
         ax.set_xlim(0, field_um); ax.set_ylim(field_um, 0)
-
-        # Optional contour at natural abundance
-        if contour_natural_abundance and natural_abundance is not None:
-            R_for_contour = np.where(mask, R, np.nan)
-            try:
-                ax.contour(R_for_contour,
-                           levels=[natural_abundance],
-                           extent=[0, field_um, field_um, 0],
-                           colors='white', linewidths=0.7, alpha=0.8)
-            except Exception:
-                pass
 
         if fig is not None:
             sm = ScalarMappable(norm=Normalize(vmin=ratio_min_disp,

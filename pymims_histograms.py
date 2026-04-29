@@ -7,10 +7,24 @@ of summed-stack pixel intensities (drift-corrected if available), fits
 1..k_max-component Gaussian mixtures, and reports the candidates side-by-side
 so the user can judge overfitting visually as well as by BIC/AIC.
 
-Output is intended to inform v0.6's rule-based ROI generator — the
-crossing-point thresholds between adjacent fitted components are the natural
-"counts ≥ X" cutoffs for segmenting an image into bulk / mid / hot regions
-without having to guess at percentiles.
+Outputs feed v0.6's rule-based ROI generator. Three threshold modes are
+supported downstream:
+
+  * counts          — raw pixel count cutoff (e.g. ≥50 counts).
+                      Useful when count rates have absolute physical meaning,
+                      but breaks across acquisitions of different durations.
+  * percentile      — empirical quantile cutoff (e.g. top 10%).
+                      Acquisition-invariant; same biological feature picks
+                      out the same pixel set regardless of integration time.
+  * gmm-component   — pixels belonging to a specific GMM component.
+                      Both acquisition-invariant and morphology-aware: the
+                      GMM identifies the labelled population, regardless of
+                      where it sits on the count axis.
+
+The fit results dict therefore reports all three sources:
+  - thresholds_by_k    : crossing-point cutoffs (raw counts) for each k
+  - empirical_quantiles: full quantile-table at fixed percentile breakpoints
+  - components_by_k    : per-component mean / std / weight / quantile tables
 
 Author : G. McMahon (with AI-assisted development)
 Created: April 2026 (v0.6 work-in-progress)
@@ -18,25 +32,37 @@ Created: April 2026 (v0.6 work-in-progress)
 Usage
 -----
     from pymims import MimsImage
-    from pymims_histograms import plot_histograms, fit_channel_gmm
+    from pymims_histograms import plot_histograms, best_thresholds
 
     img = MimsImage('myfile.im')
     img.drift_correct(reference='SE')
 
-    # Side-by-side candidate fits (k=1..6) for every channel:
+    # Side-by-side candidate fits (k=1..6) for every channel.
     result = plot_histograms(img, k_max=6)
 
-    # Or just one channel:
-    result = plot_histograms(img, channel='12C 14N', k_max=6)
+    # Default ROI cutoffs (BIC pick, raw-count crossing points)
+    thresholds = best_thresholds(result)
 
-    # The returned dict contains, for each channel:
-    #   'best_k', 'bics', 'aics', 'models', 'thresholds_by_k', 'frac_zeros'
-    # Use thresholds_by_k[best_k] as candidate ROI cutoffs.
+    # Override BIC where the side-by-side panels show overfitting:
+    thresholds = best_thresholds(result, manual_k={'31P': 3, '12C 15N': 2})
+
+    # For percentile-based rules, read from the empirical_quantiles entry:
+    #   p90_31P_counts = result['31P']['empirical_quantiles'][90]
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+
+
+# Fixed percentile grid reported for every channel. Chosen to span the
+# typical ROI-selection use cases:
+#   * extreme tails (1, 99) — outlier diagnostics
+#   * shoulders (5, 95)     — broad-thresholding regions
+#   * top-N-percent rules (90, 95, 99) — common biology cutoffs
+#   * IQR (25, 75)          — distribution shape
+#   * median (50)           — robust central tendency
+PERCENTILES = (1, 5, 10, 25, 50, 75, 90, 95, 99)
 
 
 # ── Core fitting routine ─────────────────────────────────────────────────────
@@ -68,15 +94,34 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
     Returns
     -------
     dict with keys:
-      'log_values'     : 1-D array of log10(values) actually used in fit
-      'frac_zeros'     : fraction of input pixels that were zero
-      'frac_used'      : fraction of input pixels used in fit
-      'models'         : list[GaussianMixture] indexed by k-1
-      'bics'           : array of BIC values (length k_max)
-      'aics'           : array of AIC values (length k_max)
-      'best_k_bic'     : int, k with lowest BIC
-      'best_k_aic'     : int, k with lowest AIC
-      'thresholds_by_k': dict {k -> list of crossing-point thresholds (linear units, NOT log)}
+      'log_values'         : 1-D array of log10(values) actually used in fit
+      'frac_zeros'         : fraction of input pixels that were zero
+      'frac_used'          : fraction of input pixels used in fit
+      'n_pixels_used'      : count of pixels used in the fit (after zero-handling)
+      'models'             : list[GaussianMixture] indexed by k-1
+      'bics'               : array of BIC values (length k_max)
+      'aics'               : array of AIC values (length k_max)
+      'best_k_bic'         : int, k with lowest BIC
+      'best_k_aic'         : int, k with lowest AIC
+      'thresholds_by_k'    : dict {k -> list of crossing-point thresholds}
+                              (linear units, NOT log; one entry per k)
+      'empirical_quantiles': dict {percentile -> count value}
+                              keys are PERCENTILES; values are raw counts.
+                              Computed from the data WITHOUT jitter — these
+                              are the honest quantiles a campaign user wants
+                              for percentile-based ROI rules.
+      'components_by_k'    : dict {k -> list[dict]}
+                              For each k, a list of per-component summary
+                              dicts (sorted by mean), each containing:
+                                'weight'         : mixing fraction (Σ = 1)
+                                'mean_counts'    : component mean (linear)
+                                'std_log10'      : std-dev in log10-space
+                                'mean_log10'     : mean in log10-space
+                                'quantiles'      : dict {percentile -> count}
+                                                   for the component-conditional
+                                                   distribution. Use these for
+                                                   "top 10% within the labelled
+                                                   population" style rules.
     """
     try:
         from sklearn.mixture import GaussianMixture
@@ -98,6 +143,15 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
         frac_zeros = float(np.sum(v == 0) / n_total) if n_total else 0.0
         v = v + 0.5
 
+    # Empirical quantiles — computed BEFORE jitter so they reflect the
+    # actual integer count distribution. Reported in raw count units.
+    if v.size:
+        empirical_quantiles = {
+            int(p): float(np.percentile(v, p)) for p in PERCENTILES
+        }
+    else:
+        empirical_quantiles = {int(p): 0.0 for p in PERCENTILES}
+
     # Optional jitter for integer-valued counts. Done in linear space so
     # the average is preserved; we then go to log10.
     if jitter and v.size:
@@ -111,12 +165,15 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
             'log_values': np.log10(v) if v.size else np.array([]),
             'frac_zeros': frac_zeros,
             'frac_used': v.size / n_total if n_total else 0.0,
+            'n_pixels_used': int(v.size),
             'models': [],
             'bics': np.array([]),
             'aics': np.array([]),
             'best_k_bic': None,
             'best_k_aic': None,
             'thresholds_by_k': {},
+            'empirical_quantiles': empirical_quantiles,
+            'components_by_k': {},
         }
 
     log_v = np.log10(v).reshape(-1, 1)
@@ -125,6 +182,7 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
     bics = []
     aics = []
     thresholds_by_k = {}
+    components_by_k = {}
 
     for k in range(1, k_max + 1):
         gm = GaussianMixture(
@@ -141,6 +199,8 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
 
         # Crossing-point thresholds (in linear units, where v lives)
         thresholds_by_k[k] = _crossing_thresholds(gm, log_v)
+        # Per-component summaries (weight, mean, std, conditional quantiles)
+        components_by_k[k] = _component_summaries(gm)
 
     bics = np.asarray(bics)
     aics = np.asarray(aics)
@@ -149,12 +209,15 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
         'log_values': log_v.ravel(),
         'frac_zeros': frac_zeros,
         'frac_used': v.size / n_total if n_total else 0.0,
+        'n_pixels_used': int(v.size),
         'models': models,
         'bics': bics,
         'aics': aics,
         'best_k_bic': int(np.argmin(bics)) + 1,
         'best_k_aic': int(np.argmin(aics)) + 1,
         'thresholds_by_k': thresholds_by_k,
+        'empirical_quantiles': empirical_quantiles,
+        'components_by_k': components_by_k,
     }
 
 
@@ -202,6 +265,53 @@ def _crossing_thresholds(gm, log_v):
         thresholds.append(10.0 ** log_thr)
 
     return thresholds
+
+
+def _component_summaries(gm):
+    """
+    Per-component summary table for a fitted GMM.
+
+    Components are sorted by mean (ascending), so component 0 is always the
+    leftmost (lowest-count) population — typically background — and the last
+    is the rightmost (highest-count) — typically the labelled population.
+
+    For each component the within-component quantile at percentile p is the
+    p-th quantile of N(μ_log, σ_log²) in log10 space, then exponentiated:
+        q_p = 10 ** (μ_log + σ_log · Φ⁻¹(p/100))
+    This is exact for Gaussian-in-log-space components.
+
+    Returns
+    -------
+    list[dict], one per component, each containing:
+        weight       : mixing fraction (fits sum to 1)
+        mean_counts  : 10**μ_log — component mean in linear count units
+        mean_log10   : μ_log
+        std_log10    : σ_log
+        quantiles    : dict {percentile -> linear count}
+                       per the closed-form lognormal quantile above.
+    """
+    means_log = gm.means_.ravel()
+    stds_log  = np.sqrt(gm.covariances_.ravel())   # full covariance, 1-D ⇒ scalar
+    weights   = gm.weights_
+
+    order = np.argsort(means_log)
+    summaries = []
+    for j in order:
+        mu  = float(means_log[j])
+        sd  = float(stds_log[j])
+        wt  = float(weights[j])
+        quantiles = {
+            int(p): float(10.0 ** (mu + sd * norm.ppf(p / 100.0)))
+            for p in PERCENTILES
+        }
+        summaries.append({
+            'weight'      : wt,
+            'mean_counts' : float(10.0 ** mu),
+            'mean_log10'  : mu,
+            'std_log10'   : sd,
+            'quantiles'   : quantiles,
+        })
+    return summaries
 
 
 # ── Plotting ─────────────────────────────────────────────────────────────────
@@ -406,7 +516,8 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
 
 
 def _print_summary(results):
-    """Tabular print of BIC table + suggested thresholds for each channel."""
+    """Tabular print of BIC table, GMM thresholds, empirical quantiles,
+    and per-component summaries for each channel."""
     print()
     for label, fit in results.items():
         if len(fit['models']) == 0:
@@ -416,17 +527,37 @@ def _print_summary(results):
         d_bic = bics - bics.min()
         best = fit['best_k_bic']
         zero_pct = fit['frac_zeros'] * 100.0
-        print(f'  {label:20s}  best k={best}  zero pixels: {zero_pct:.1f}%')
+        n_used = fit.get('n_pixels_used', '?')
+        print(f'  {label}   best k={best}  '
+              f'zero pixels: {zero_pct:.1f}%   '
+              f'pixels in fit: {n_used}')
         # ΔBIC table
         bic_str = '    ΔBIC: ' + '  '.join(
             f'k={k}:{d:.0f}' for k, d in zip(range(1, len(bics) + 1), d_bic)
         )
         print(bic_str)
-        # Thresholds for the best k
+        # Crossing-point thresholds for the best k
         thrs = fit['thresholds_by_k'][best]
         if thrs:
             thr_str = ', '.join(f'{t:.1f}' for t in thrs)
-            print(f'    thresholds (counts) at best k: {thr_str}')
+            print(f'    GMM crossings (counts) at best k: {thr_str}')
+        # Empirical quantiles (acquisition-invariant percentile cutoffs)
+        eq = fit['empirical_quantiles']
+        eq_str = '    Empirical quantiles (counts):  ' + '  '.join(
+            f'p{p}={v:.1f}' for p, v in eq.items()
+        )
+        print(eq_str)
+        # Per-component breakdown at best k
+        comps = fit['components_by_k'].get(best, [])
+        if comps:
+            print(f'    Components at k={best} (sorted by mean):')
+            print(f'      {"#":>2} {"weight":>7} {"mean":>10} '
+                  f'{"p5":>9} {"p50":>9} {"p95":>9}')
+            for i, c in enumerate(comps):
+                q = c['quantiles']
+                print(f'      {i:>2} {c["weight"]:>7.1%} '
+                      f'{c["mean_counts"]:>10.2f} '
+                      f'{q[5]:>9.2f} {q[50]:>9.2f} {q[95]:>9.2f}')
         print()
 
 

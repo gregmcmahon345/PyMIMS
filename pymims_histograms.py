@@ -68,7 +68,7 @@ PERCENTILES = (1, 5, 10, 25, 50, 75, 90, 95, 99)
 # ── Core fitting routine ─────────────────────────────────────────────────────
 
 def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
-                    jitter=True):
+                    jitter=True, tail_weight_threshold=0.10):
     """
     Fit Gaussian mixtures with k = 1..k_max on log10(values).
 
@@ -90,6 +90,16 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
         artifacts that misspecify continuous GMM. Jitter softens these
         without biasing the distribution. Disable only if you have already
         non-integer or pre-binned data.
+    tail_weight_threshold : float, default 0.10
+        Threshold for raising a tail-warning. If incrementing the sensible_k
+        pick by 1 would introduce a new component whose mixing weight is
+        below this fraction AND whose mean is higher than every component
+        at the current sensible_k, a warning is raised. Catches cases where
+        rare high-count populations (e.g. Fe:S clusters in mitochondria,
+        hot-spot enrichment, isolated organelles) would be suppressed by
+        the conservative default. Lower values catch rarer features at the
+        cost of more false alarms. 0.10 is a conservative default; 0.05 is
+        appropriate when you expect rare biological features.
 
     Returns
     -------
@@ -103,6 +113,18 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
       'aics'               : array of AIC values (length k_max)
       'best_k_bic'         : int, k with lowest BIC
       'best_k_aic'         : int, k with lowest AIC
+      'tail_warning'       : None or dict. When non-None, indicates that
+                              k=sensible_k+1 would reveal a rare high-count
+                              component the conservative pick is suppressing.
+                              Dict contains:
+                                'suggested_k'   : int — k+1
+                                'weight'        : float — fraction of pixels
+                                                  in the new component
+                                'mean_counts'   : float — its mean
+                                'p5','p50','p95': float — its quantiles
+                              If you see this on a channel where rare
+                              high-count features matter (Fe:S clusters,
+                              hot organelles), override with manual_k.
       'sensible_k'         : int, conservative-consensus pick from elbow
                               heuristics (largest-drop ∩ kneedle); favoured
                               over best_k_bic when ΔBIC has a long shallow
@@ -112,6 +134,19 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
       'heuristics_agree'   : bool, whether the two elbow methods agreed.
                               Disagreement is itself a useful signal —
                               eyeball the side-by-side panels.
+      'unique_k_recommendations' : list[dict], one entry per unique k
+                              picked by any of the three methods (BIC,
+                              largest-drop, kneedle), ordered ascending
+                              by k. Each entry has:
+                                'k'       : int — the recommended k
+                                'methods' : list[str] — which of
+                                            ['bic', 'largest_drop',
+                                            'kneedle'] picked this k
+                              When all three agree there is one entry;
+                              when they all disagree there are three.
+                              Used for "show me a table per recommended k"
+                              workflows where the disagreement itself is
+                              what you want to inspect.
       'thresholds_by_k'    : dict {k -> list of crossing-point thresholds}
                               (linear units, NOT log; one entry per k)
       'empirical_quantiles': dict {percentile -> count value}
@@ -184,6 +219,8 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
             'largest_drop_k': None,
             'kneedle_k': None,
             'heuristics_agree': None,
+            'unique_k_recommendations': [],
+            'tail_warning': None,
             'thresholds_by_k': {},
             'empirical_quantiles': empirical_quantiles,
             'components_by_k': {},
@@ -218,6 +255,19 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
     bics = np.asarray(bics)
     aics = np.asarray(aics)
     elbow = _sensible_k(bics, k_max)
+    bic_k = int(np.argmin(bics)) + 1
+    unique_recs = _unique_k_recommendations(
+        bic_k=bic_k,
+        sensible_k=elbow['sensible_k'],
+        largest_drop_k=elbow['largest_drop_k'],
+        kneedle_k=elbow['kneedle_k'],
+    )
+    tail_warning = _detect_tail_warning(
+        components_by_k=components_by_k,
+        sensible_k=elbow['sensible_k'],
+        k_max=k_max,
+        weight_threshold=tail_weight_threshold,
+    )
 
     return {
         'log_values': log_v.ravel(),
@@ -227,12 +277,14 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
         'models': models,
         'bics': bics,
         'aics': aics,
-        'best_k_bic': int(np.argmin(bics)) + 1,
+        'best_k_bic': bic_k,
         'best_k_aic': int(np.argmin(aics)) + 1,
         'sensible_k'      : elbow['sensible_k'],
         'largest_drop_k'  : elbow['largest_drop_k'],
         'kneedle_k'       : elbow['kneedle_k'],
         'heuristics_agree': elbow['heuristics_agree'],
+        'unique_k_recommendations': unique_recs,
+        'tail_warning'     : tail_warning,
         'thresholds_by_k': thresholds_by_k,
         'empirical_quantiles': empirical_quantiles,
         'components_by_k': components_by_k,
@@ -436,10 +488,99 @@ def _sensible_k(bics, k_max):
     }
 
 
+def _unique_k_recommendations(bic_k, sensible_k, largest_drop_k, kneedle_k):
+    """
+    Build a deduplicated, ordered list of k recommendations from BIC,
+    largest-drop, and kneedle. The 'sensible_k' value is just the
+    consensus of the two elbow heuristics, so it is implicitly covered
+    by largest_drop_k and kneedle_k — we don't list it separately.
+
+    Returns
+    -------
+    list[dict] sorted ascending by k, each entry containing:
+        'k'       : int
+        'methods' : list[str] — labels from ['bic', 'largest_drop',
+                    'kneedle'] indicating which method(s) picked this k.
+
+    When the methods all agree, the list has one entry. When they all
+    disagree, the list has three.
+    """
+    # Each method contributes one (label, k) pair.
+    picks = []
+    if bic_k is not None:
+        picks.append(('bic', bic_k))
+    if largest_drop_k is not None:
+        picks.append(('largest_drop', largest_drop_k))
+    if kneedle_k is not None:
+        picks.append(('kneedle', kneedle_k))
+
+    # Group by k value
+    by_k = {}
+    for method, k in picks:
+        by_k.setdefault(k, []).append(method)
+
+    return [{'k': k, 'methods': by_k[k]} for k in sorted(by_k)]
+
+
+def _detect_tail_warning(components_by_k, sensible_k, k_max,
+                         weight_threshold=0.10):
+    """
+    Check whether incrementing sensible_k would reveal a low-weight,
+    high-mean component the conservative pick is suppressing.
+
+    The signature of "you're hiding a rare hot population":
+      * k+1 introduces a NEW component (not present at k=sensible_k)
+      * its mixing weight is below `weight_threshold`
+      * its mean count is HIGHER than every component at k=sensible_k
+
+    "New component at k+1 not present at k" is a fuzzy concept since
+    sklearn refits each k from scratch — components don't have stable
+    identities across k. We approximate it as: the highest-mean component
+    at k+1 has a higher mean than the highest-mean component at k. That
+    catches the "tail revealed by adding a component" case while not
+    triggering when k+1 just splits an existing low-count component.
+
+    Returns
+    -------
+    None if no warning. Otherwise a dict:
+        'suggested_k'  : int — sensible_k + 1
+        'weight'       : float — mixing fraction of the suppressed component
+        'mean_counts'  : float — its linear-space mean
+        'p5','p50','p95': float — quantiles of the suppressed component
+    """
+    if sensible_k is None or sensible_k >= k_max:
+        return None
+    comps_at_k   = components_by_k.get(sensible_k, [])
+    comps_at_kp1 = components_by_k.get(sensible_k + 1, [])
+    if not comps_at_k or not comps_at_kp1:
+        return None
+
+    max_mean_at_k = max(c['mean_counts'] for c in comps_at_k)
+    # Top component at k+1 is the last (sorted by mean ascending)
+    top_kp1 = comps_at_kp1[-1]
+
+    # Trigger condition: top component at k+1 has a higher mean AND a low
+    # mixing weight. Both must hold; otherwise k+1 is just splitting an
+    # existing component rather than revealing a new tail.
+    if (top_kp1['mean_counts'] > max_mean_at_k
+            and top_kp1['weight'] < weight_threshold):
+        q = top_kp1['quantiles']
+        return {
+            'suggested_k' : sensible_k + 1,
+            'weight'      : top_kp1['weight'],
+            'mean_counts' : top_kp1['mean_counts'],
+            'p5'          : q[5],
+            'p50'         : q[50],
+            'p95'         : q[95],
+        }
+    return None
+
+
 # ── Plotting ─────────────────────────────────────────────────────────────────
 
 def plot_histograms(img, channel=None, k_max=6, n_bins=80,
                     drop_zeros=True, corrected=True, jitter=True,
+                    tail_weight_threshold=0.10,
                     figsize_per_panel=(2.8, 2.4), outpath=None,
                     show=True, verbose=True):
     """
@@ -503,7 +644,8 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
         label = img.masses[ch_idx]
         pixel_vals = summed[ch_idx].ravel()
         fit = fit_channel_gmm(pixel_vals, k_max=k_max, drop_zeros=drop_zeros,
-                              jitter=jitter)
+                              jitter=jitter,
+                              tail_weight_threshold=tail_weight_threshold)
         results[label] = fit
 
         if len(fit['models']) == 0:
@@ -521,6 +663,8 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
         aics = fit['aics']
         best_k = fit['best_k_bic']
         sensible = fit['sensible_k']
+        drop_k_local = fit['largest_drop_k']
+        knee_k_local = fit['kneedle_k']
 
         # Clip the visible range to avoid a few extreme outliers stretching
         # the axis and squashing the bulk distribution into a sliver. The
@@ -572,17 +716,21 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
                     ax.axvline(lt, color='red', linewidth=0.8,
                                linestyle=':', alpha=0.7)
 
-            # Title with k and BIC. ★ = min-BIC pick, ◆ = sensible_k pick
-            # (both shown when they disagree).
-            markers = ''
-            if k == best_k: markers += ' ★'
-            if k == sensible and sensible != best_k: markers += ' ◆'
-            elif k == sensible and sensible == best_k: markers = ' ★◆'
-            title_color = 'black'
+            # Title with k and BIC. Marker letters indicate which methods
+            # picked this k:
+            #   B = min-BIC,  D = largest-drop,  K = kneedle
+            # The k chosen as 'sensible' (default for ROIs) gets a green title.
+            picked_by = []
+            if k == best_k:        picked_by.append('B')
+            if k == drop_k_local:  picked_by.append('D')
+            if k == knee_k_local:  picked_by.append('K')
+            markers = f'  [{",".join(picked_by)}]' if picked_by else ''
             if k == sensible:
-                title_color = 'darkgreen'        # sensible pick is the recommended one
-            elif k == best_k:
-                title_color = 'darkred'          # BIC pick (when sensible disagrees)
+                title_color = 'darkgreen'   # default for ROI rules
+            elif picked_by:
+                title_color = 'darkred'     # picked by some method but not sensible
+            else:
+                title_color = 'black'
             ax.set_title(f'k = {k}{markers}\nBIC = {bics[k-1]:.0f}',
                          fontsize=9, color=title_color)
             ax.set_xlim(x_lo, x_hi)
@@ -602,6 +750,9 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
         # Channel label on leftmost panel
         axes[row][0].set_ylabel(label, fontsize=10, fontweight='bold')
 
+        # (Tail warnings are drawn after layout finalises so coordinates
+        # are correct — see the deferred block below this loop.)
+
         # ── BIC / AIC summary panel ─────────────────────────────────────────
         ax = axes[row][n_cols - 1]
         ks = np.arange(1, k_max + 1)
@@ -612,24 +763,29 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
         ax.plot(ks, d_aic, 's--', color='darkorange', label='ΔAIC',
                 linewidth=1.0, alpha=0.8)
         ax.axhline(10, color='gray', linewidth=0.6, linestyle=':')
-        # Mark BIC pick (red) and sensible_k pick (green). When they agree,
-        # only one line is visible.
-        if best_k != sensible:
-            ax.axvline(best_k, color='darkred', linewidth=0.8, alpha=0.6,
-                       label=f'BIC k={best_k}')
-            ax.axvline(sensible, color='darkgreen', linewidth=1.2, alpha=0.8,
-                       label=f'sensible k={sensible}')
-        else:
-            ax.axvline(best_k, color='darkgreen', linewidth=1.2, alpha=0.8,
-                       label=f'k={best_k}')
+        # Mark each unique recommendation with a vertical line. The sensible
+        # pick is drawn last/thickest in green; others are thinner red.
+        unique_ks = sorted({best_k, drop_k_local, knee_k_local})
+        for kv in unique_ks:
+            if kv == sensible:
+                ax.axvline(kv, color='darkgreen', linewidth=1.4, alpha=0.85)
+            else:
+                ax.axvline(kv, color='darkred', linewidth=0.8, alpha=0.5)
         ax.set_xlabel('k', fontsize=8)
         ax.set_ylabel('Δ from best', fontsize=8)
-        if best_k == sensible:
-            title_str = f'k = {best_k}'
+        # Title: all-agree, two-disagree, or three-way fork
+        if len(unique_ks) == 1:
+            title_str = f'k = {sensible}  (all agree)'
+            title_color = 'darkgreen'
+        elif len(unique_ks) == 2:
+            other = [kv for kv in unique_ks if kv != sensible][0]
+            title_str = f'use k={sensible}   (other: {other})'
+            title_color = 'darkgreen'
         else:
-            title_str = f'BIC k={best_k}  →  use k={sensible}'
-        ax.set_title(title_str, fontsize=9,
-                     color='darkgreen' if best_k == sensible else 'darkred')
+            title_str = (f'use k={sensible}   '
+                         f'(B={best_k}  D={drop_k_local}  K={knee_k_local})')
+            title_color = 'darkgreen'
+        ax.set_title(title_str, fontsize=9, color=title_color)
         ax.tick_params(labelsize=7)
         ax.legend(fontsize=6, loc='upper right', frameon=False)
         for spine in ('top', 'right'):
@@ -641,11 +797,50 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
 
     fig.suptitle(
         f'Pixel-intensity histograms with GMM candidates  '
-        f'(red dotted lines = crossing thresholds; ★ = min-BIC; '
-        f'◆ = sensible_k recommendation)',
+        f'(red dotted lines = crossing thresholds; '
+        f'B = min-BIC, D = largest-drop, K = kneedle; green = ROI default)',
         fontsize=10, y=1.0,
     )
     fig.tight_layout()
+
+    # If any channel has a tail warning, give it room above the row.
+    any_warning = any(fit.get('tail_warning') is not None
+                      for fit in results.values())
+    if any_warning:
+        fig.subplots_adjust(top=0.82, hspace=0.85)
+        # Re-anchor the suptitle higher so the warning banners can sit
+        # below it without overlapping panel titles
+        for txt in fig.texts:
+            pass  # keep simple; suptitle uses y=1.0 already
+
+    # Now draw tail warnings in figure coordinates — done AFTER layout
+    # settles so that axes bboxes are final and the warning is positioned
+    # correctly above each affected row's panel titles.
+    if any_warning:
+        for row, ch_idx in enumerate(channels):
+            label = img.masses[ch_idx]
+            fit = results[label]
+            tw = fit.get('tail_warning')
+            if tw is None:
+                continue
+            warn_msg = (f'⚠ TAIL AT k={tw["suggested_k"]}: '
+                        f'{tw["weight"]*100:.1f}% of pixels at mean '
+                        f'{tw["mean_counts"]:.1f} cts (p95={tw["p95"]:.1f}) '
+                        f'— consider manual_k={{{label!r}: {tw["suggested_k"]}}}')
+            ax_lo = axes[row][0]
+            bbox = ax_lo.get_position()
+            # Place above the row's panel titles. Panel titles consume about
+            # 0.025 in figure coords, so we offset by a bit more than that.
+            y_pos = bbox.y1 + 0.055
+            fig.text(
+                bbox.x0, y_pos, warn_msg,
+                fontsize=8.5, fontweight='bold', color='darkred',
+                ha='left', va='bottom',
+                bbox=dict(boxstyle='round,pad=0.3',
+                          facecolor='#fff5cc',
+                          edgecolor='darkred', linewidth=1.0,
+                          alpha=0.95),
+            )
 
     if outpath:
         fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
@@ -663,7 +858,12 @@ def plot_histograms(img, channel=None, k_max=6, n_bins=80,
 
 def _print_summary(results):
     """Tabular print of BIC table, GMM thresholds, empirical quantiles,
-    and per-component summaries for each channel."""
+    and per-component summaries for each channel.
+
+    When BIC, largest-drop, and kneedle pick different k values, prints
+    a separate component table for each unique k so you can compare them
+    directly. When they all agree, prints a single block.
+    """
     print()
     for label, fit in results.items():
         if len(fit['models']) == 0:
@@ -675,18 +875,39 @@ def _print_summary(results):
         sensible = fit['sensible_k']
         drop_k = fit['largest_drop_k']
         knee_k = fit['kneedle_k']
-        agree = fit['heuristics_agree']
         zero_pct = fit['frac_zeros'] * 100.0
         n_used = fit.get('n_pixels_used', '?')
+        unique_recs = fit.get('unique_k_recommendations', [])
 
-        # Summary line: highlight when sensible_k disagrees with BIC
-        if bic_k == sensible:
-            k_msg = f'k={sensible}  (BIC and elbow agree)'
+        # Header line
+        if len(unique_recs) == 1:
+            k_msg = (f'all methods agree on k={unique_recs[0]["k"]}')
+        elif bic_k == sensible:
+            # Sensible_k matches BIC, but elbow methods themselves disagreed
+            k_msg = (f'BIC and sensible_k agree on k={sensible}; '
+                     f'largest-drop says {drop_k}, kneedle says {knee_k}')
         else:
-            k_msg = (f'k={sensible}  (recommended; BIC says {bic_k}, '
-                     f'largest-drop says {drop_k}, kneedle says {knee_k})')
+            k_msg = (f'recommended k={sensible}; BIC says {bic_k}, '
+                     f'largest-drop says {drop_k}, kneedle says {knee_k}')
         print(f'  {label}   {k_msg}   '
               f'zero pixels: {zero_pct:.1f}%   pixels in fit: {n_used}')
+
+        # Tail-warning banner — printed prominently when a low-weight,
+        # high-mean component is being suppressed. ANSI escape codes
+        # (\033[1;31m … \033[0m) render as bold red in Colab/Jupyter.
+        tw = fit.get('tail_warning')
+        if tw is not None:
+            print(
+                f'    \033[1;31m⚠ TAIL WARNING:\033[0m '
+                f'k={tw["suggested_k"]} reveals a {tw["weight"]*100:.1f}%-weight '
+                f'component at mean {tw["mean_counts"]:.1f} counts '
+                f'(p5={tw["p5"]:.1f}, p50={tw["p50"]:.1f}, p95={tw["p95"]:.1f}).'
+            )
+            print(
+                f'      If rare high-count features (Fe:S clusters, hot organelles, '
+                f'isolated enrichment) matter for this channel, '
+                f'override with manual_k={{{label!r}: {tw["suggested_k"]}}}.'
+            )
 
         # ΔBIC table
         bic_str = '    ΔBIC: ' + '  '.join(
@@ -694,37 +915,39 @@ def _print_summary(results):
         )
         print(bic_str)
 
-        # Crossing-point thresholds at sensible_k
-        thrs = fit['thresholds_by_k'][sensible]
-        if thrs:
-            thr_str = ', '.join(f'{t:.1f}' for t in thrs)
-            print(f'    GMM crossings (counts) at k={sensible}: {thr_str}')
-
-        # Empirical quantiles
+        # Empirical quantiles (model-free, shown once per channel)
         eq = fit['empirical_quantiles']
         eq_str = '    Empirical quantiles (counts):  ' + '  '.join(
             f'p{p}={v:.1f}' for p, v in eq.items()
         )
         print(eq_str)
 
-        # Per-component breakdown at sensible_k (the recommended pick)
-        comps = fit['components_by_k'].get(sensible, [])
-        if comps:
-            print(f'    Components at k={sensible} (sorted by mean):')
-            print(f'      {"#":>2} {"weight":>7} {"mean":>10} '
-                  f'{"p5":>9} {"p50":>9} {"p95":>9}')
-            for i, c in enumerate(comps):
-                q = c['quantiles']
-                print(f'      {i:>2} {c["weight"]:>7.1%} '
-                      f'{c["mean_counts"]:>10.2f} '
-                      f'{q[5]:>9.2f} {q[50]:>9.2f} {q[95]:>9.2f}')
+        # ── One block per unique k recommendation ──────────────────────────
+        for rec in unique_recs:
+            k = rec['k']
+            methods = rec['methods']
+            method_str = ', '.join(methods)
+            # Mark sensible-k pick (the default ROI rule) with an arrow
+            arrow = '  ← default for ROIs' if k == sensible else ''
+            header = f'    ── k={k}  (picked by: {method_str}){arrow} ──'
+            print(header)
 
-        # If BIC disagrees, also briefly show what BIC's pick would have given
-        if bic_k != sensible:
-            bic_thrs = fit['thresholds_by_k'][bic_k]
-            if bic_thrs:
-                bic_thr_str = ', '.join(f'{t:.1f}' for t in bic_thrs)
-                print(f'    (For reference: BIC k={bic_k} crossings: {bic_thr_str})')
+            # Crossings at this k
+            thrs = fit['thresholds_by_k'].get(k, [])
+            if thrs:
+                thr_str = ', '.join(f'{t:.1f}' for t in thrs)
+                print(f'      GMM crossings (counts): {thr_str}')
+
+            # Per-component table
+            comps = fit['components_by_k'].get(k, [])
+            if comps:
+                print(f'      {"#":>2} {"weight":>7} {"mean":>10} '
+                      f'{"p5":>9} {"p50":>9} {"p95":>9}')
+                for i, c in enumerate(comps):
+                    q = c['quantiles']
+                    print(f'      {i:>2} {c["weight"]:>7.1%} '
+                          f'{c["mean_counts"]:>10.2f} '
+                          f'{q[5]:>9.2f} {q[50]:>9.2f} {q[95]:>9.2f}')
         print()
 
 

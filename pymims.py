@@ -893,6 +893,10 @@ class MimsImage:
                  intensity='denominator',
                  cmap='viridis', cmap_reverse=False,
                  ratio_min=None, ratio_max=None,
+                 scale_factor=1.0,
+                 natural_abundance=None,
+                 show_natural_abundance=True,
+                 contour_natural_abundance=False,
                  intensity_percentile=(1, 99.5),
                  min_counts=None,
                  scalebar_color='white',
@@ -929,8 +933,34 @@ class MimsImage:
         cmap_reverse : bool
             Reverse the colourmap (equivalent to using a `_r` suffix).
         ratio_min, ratio_max : float or None
-            Hue scaling range. If None, uses (1st, 99th) percentile of the
-            ratio for valid pixels. Pixels outside this range are clipped.
+            Hue scaling range, expressed in *display units* — i.e. after
+            scale_factor is applied. If scale_factor=10000, then setting
+            ratio_min=37 means "natural-abundance for ¹⁵N/¹⁴N". If None,
+            uses (1st, 99th) percentile of the ratio for valid pixels.
+            Pixels outside this range are clipped.
+        scale_factor : float
+            Convenience multiplier for the colorbar display. The OpenMIMS
+            convention uses 10000 for low-abundance isotope ratios so that
+            ¹⁵N/¹⁴N reads as "37 ± a few hundred" instead of
+            "0.0037 ± a few × 10⁻³". Underlying ratio data is unchanged;
+            only the colorbar (and ratio_min/ratio_max interpretation) are
+            scaled. Default 1.0 = no scaling.
+        natural_abundance : float or None
+            Reference natural-abundance ratio in *unscaled* units (i.e.
+            0.0037 for ¹⁵N/¹⁴N, regardless of scale_factor). Used by
+            show_natural_abundance and contour_natural_abundance. Caller is
+            responsible for supplying this; the library does not infer it
+            from labels.
+        show_natural_abundance : bool
+            If True (default) and natural_abundance is provided, mark the
+            natural-abundance value on the colorbar as a horizontal tick +
+            label.
+        contour_natural_abundance : bool
+            If True and natural_abundance and min_counts are both provided,
+            draw a thin contour line on the image at ratio = natural_abundance.
+            Pixels below min_counts are excluded from the contour (the mask
+            constraint avoids chaotic squiggles in low-count regions).
+            Raises ValueError if enabled without min_counts.
         intensity_percentile : (lo, hi)
             Percentile clip for the intensity normalisation (default 1, 99.5).
         min_counts : float or None
@@ -946,6 +976,18 @@ class MimsImage:
             fig  : matplotlib Figure
             info : dict with ratio, intensity, mask, ratio_range, cmap_name
         """
+        # Validate contour-line constraint up-front
+        if contour_natural_abundance:
+            if natural_abundance is None:
+                raise ValueError(
+                    "contour_natural_abundance=True requires natural_abundance "
+                    "to be specified."
+                )
+            if min_counts is None:
+                raise ValueError(
+                    "contour_natural_abundance=True requires min_counts to be "
+                    "set, to avoid noisy contour squiggles in low-count regions."
+                )
         # Map our cmap aliases
         cmap_alias = {
             'rainbow'         : 'hsv',
@@ -997,15 +1039,26 @@ class MimsImage:
         finite = np.isfinite(R)
         if not finite.any():
             raise ValueError("No valid pixels — relax masking thresholds.")
+
+        # ratio_min / ratio_max are supplied in DISPLAY units (i.e. after
+        # scale_factor). Convert to raw units for internal use.
         if ratio_min is None:
-            ratio_min = float(np.percentile(R[finite], 1))
+            ratio_min_raw = float(np.percentile(R[finite], 1))
+        else:
+            ratio_min_raw = float(ratio_min) / scale_factor
         if ratio_max is None:
-            ratio_max = float(np.percentile(R[finite], 99))
-        if ratio_max <= ratio_min:
-            ratio_max = ratio_min + 1e-12
+            ratio_max_raw = float(np.percentile(R[finite], 99))
+        else:
+            ratio_max_raw = float(ratio_max) / scale_factor
+        if ratio_max_raw <= ratio_min_raw:
+            ratio_max_raw = ratio_min_raw + 1e-12
+
+        # Display-unit values for colorbar / titles
+        ratio_min_disp = ratio_min_raw * scale_factor
+        ratio_max_disp = ratio_max_raw * scale_factor
 
         # Normalise ratio to [0, 1] for colourmap lookup
-        R_norm = np.clip((R - ratio_min) / (ratio_max - ratio_min), 0, 1)
+        R_norm = np.clip((R - ratio_min_raw) / (ratio_max_raw - ratio_min_raw), 0, 1)
         # NaN pixels become 0 (will be black after intensity multiplication)
         R_norm = np.where(np.isnan(R_norm), 0, R_norm)
 
@@ -1067,32 +1120,82 @@ class MimsImage:
                 f'{sb_um:g} μm', color=scalebar_color,
                 fontsize=9, ha='center', va='bottom')
 
-        # Hue colourbar — shows the ratio scale only (no intensity component)
+        # Hue colourbar — shows the ratio scale only (no intensity component).
+        # Always normalised in display (scaled) units so ticks match the
+        # OpenMIMS convention when scale_factor is set.
         from matplotlib.colors import Normalize
         from matplotlib.cm import ScalarMappable
-        sm = ScalarMappable(norm=Normalize(vmin=ratio_min, vmax=ratio_max),
+        sm = ScalarMappable(norm=Normalize(vmin=ratio_min_disp,
+                                           vmax=ratio_max_disp),
                             cmap=colormap)
         sm.set_array([])
         cbar = fig.colorbar(sm, cax=cbar_ax)
-        cbar.set_label(f'Ratio  {num_lab}/{den_lab}',
-                       color='white', fontsize=10)
+        ratio_label = f'Ratio  {num_lab}/{den_lab}'
+        if scale_factor != 1.0:
+            # Compact superscript notation: ×10⁴ rather than ×10000
+            exp = int(round(np.log10(scale_factor)))
+            if abs(scale_factor - 10**exp) < 1e-9:
+                ratio_label += f'  ×10$^{{{exp}}}$'
+            else:
+                ratio_label += f'  ×{scale_factor:g}'
+        cbar.set_label(ratio_label, color='white', fontsize=10)
         cbar.ax.yaxis.set_tick_params(color='white', labelcolor='white',
                                       labelsize=8)
         cbar.outline.set_edgecolor('white')
+
+        # Natural-abundance tick on the colorbar (if reference provided and
+        # the value falls within the visible hue range).
+        nat_tick_drawn = False
+        if (show_natural_abundance and natural_abundance is not None
+                and ratio_min_raw <= natural_abundance <= ratio_max_raw):
+            nat_disp = natural_abundance * scale_factor
+            # Add a horizontal tick on the colorbar
+            cbar.ax.axhline(nat_disp, color='white', linewidth=1.4,
+                            linestyle='-')
+            cbar.ax.axhline(nat_disp, color='black', linewidth=0.6,
+                            linestyle='-')
+            # Annotation just outside the right edge of the colorbar
+            cbar.ax.annotate(
+                f'nat. abund.\n({nat_disp:.4g})',
+                xy=(1.0, nat_disp), xycoords=('axes fraction', 'data'),
+                xytext=(8, 0), textcoords='offset points',
+                color='white', fontsize=7,
+                ha='left', va='center',
+            )
+            nat_tick_drawn = True
+
+        # Optional contour line on the image at natural abundance
+        if contour_natural_abundance and natural_abundance is not None:
+            # Restrict the contour source to the masked region; outside the
+            # mask we set NaN so contour() ignores those pixels.
+            R_for_contour = np.where(mask, R, np.nan)
+            try:
+                ax.contour(R_for_contour,
+                           levels=[natural_abundance],
+                           extent=[0, field_um, field_um, 0],
+                           colors='white', linewidths=0.7, alpha=0.8)
+            except Exception:
+                # contour can fail if the level lies entirely outside the
+                # finite range of the masked array — that's fine, just skip.
+                pass
 
         # Title (kept compact for the smaller figure)
         title = (f"HSI {num_lab}/{den_lab}  |  "
                  f"intensity: {intensity_label}  |  "
                  f"cmap: {cmap}{'_r' if cmap_reverse else ''}\n"
-                 f"hue range: {ratio_min:.4g}–{ratio_max:.4g}  |  "
-                 f"{os.path.basename(self.path)}")
+                 f"hue range: {ratio_min_disp:.4g}–{ratio_max_disp:.4g}"
+                 + (f" (×{scale_factor:g})" if scale_factor != 1.0 else "")
+                 + f"  |  {os.path.basename(self.path)}")
         fig.suptitle(title, color='white', fontsize=8, y=0.98)
 
         info = {
             'ratio'      : R,
             'intensity'  : I,
             'mask'       : mask,
-            'ratio_range': (ratio_min, ratio_max),
+            'ratio_range': (ratio_min_raw, ratio_max_raw),
+            'ratio_range_display': (ratio_min_disp, ratio_max_disp),
+            'scale_factor': scale_factor,
+            'natural_abundance': natural_abundance,
             'cmap_name'  : cmap_name,
         }
         _finalize_figure(fig, outpath, show)
@@ -1275,12 +1378,30 @@ class MimsImage:
                           denominator=None, intensity='denominator',
                           cmap='viridis', cmap_reverse=False,
                           ratio_min=None, ratio_max=None,
+                          scale_factor=1.0,
+                          natural_abundance=None,
+                          show_natural_abundance=True,
+                          contour_natural_abundance=False,
                           intensity_percentile=(1, 99.5),
                           min_counts=None, scalebar_color='white',
                           fontsize=9, title=None):
-        """Render an HSI composite onto a given Axes."""
+        """Render an HSI composite onto a given Axes.
+
+        See plot_hsi() for parameter semantics. ratio_min / ratio_max are
+        expressed in DISPLAY (scale_factor-multiplied) units.
+        """
         from matplotlib.colors import Normalize
         from matplotlib.cm import ScalarMappable
+
+        if contour_natural_abundance:
+            if natural_abundance is None:
+                raise ValueError(
+                    "contour_natural_abundance=True requires natural_abundance."
+                )
+            if min_counts is None:
+                raise ValueError(
+                    "contour_natural_abundance=True requires min_counts."
+                )
 
         cmap_alias = {
             'rainbow': 'hsv',
@@ -1309,11 +1430,24 @@ class MimsImage:
         finite = np.isfinite(R)
         if not finite.any():
             raise ValueError("No valid pixels in HSI panel.")
-        if ratio_min is None: ratio_min = float(np.percentile(R[finite], 1))
-        if ratio_max is None: ratio_max = float(np.percentile(R[finite], 99))
-        if ratio_max <= ratio_min: ratio_max = ratio_min + 1e-12
 
-        R_norm = np.clip((R - ratio_min) / (ratio_max - ratio_min), 0, 1)
+        # ratio_min/ratio_max are in DISPLAY units; convert to raw for the
+        # internal calculations.
+        if ratio_min is None:
+            ratio_min_raw = float(np.percentile(R[finite], 1))
+        else:
+            ratio_min_raw = float(ratio_min) / scale_factor
+        if ratio_max is None:
+            ratio_max_raw = float(np.percentile(R[finite], 99))
+        else:
+            ratio_max_raw = float(ratio_max) / scale_factor
+        if ratio_max_raw <= ratio_min_raw:
+            ratio_max_raw = ratio_min_raw + 1e-12
+        ratio_min_disp = ratio_min_raw * scale_factor
+        ratio_max_disp = ratio_max_raw * scale_factor
+
+        R_norm = np.clip((R - ratio_min_raw) / (ratio_max_raw - ratio_min_raw),
+                         0, 1)
         R_norm = np.where(np.isnan(R_norm), 0, R_norm)
         cmap_obj = plt.get_cmap(cmap_name)
         rgb = cmap_obj(R_norm)[:, :, :3]
@@ -1346,16 +1480,48 @@ class MimsImage:
         ax.axis('off')
         ax.set_xlim(0, field_um); ax.set_ylim(field_um, 0)
 
+        # Optional contour at natural abundance
+        if contour_natural_abundance and natural_abundance is not None:
+            R_for_contour = np.where(mask, R, np.nan)
+            try:
+                ax.contour(R_for_contour,
+                           levels=[natural_abundance],
+                           extent=[0, field_um, field_um, 0],
+                           colors='white', linewidths=0.7, alpha=0.8)
+            except Exception:
+                pass
+
         if fig is not None:
-            sm = ScalarMappable(norm=Normalize(vmin=ratio_min, vmax=ratio_max),
+            sm = ScalarMappable(norm=Normalize(vmin=ratio_min_disp,
+                                               vmax=ratio_max_disp),
                                 cmap=cmap_obj)
             sm.set_array([])
             cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.03)
-            cbar.set_label(f'{num_lab}/{den_lab}', color='white',
-                           fontsize=fontsize)
+            cbar_label = f'{num_lab}/{den_lab}'
+            if scale_factor != 1.0:
+                exp = int(round(np.log10(scale_factor)))
+                if abs(scale_factor - 10**exp) < 1e-9:
+                    cbar_label += f'  ×10$^{{{exp}}}$'
+                else:
+                    cbar_label += f'  ×{scale_factor:g}'
+            cbar.set_label(cbar_label, color='white', fontsize=fontsize)
             cbar.ax.yaxis.set_tick_params(color='white', labelcolor='white',
                                           labelsize=fontsize - 1)
             cbar.outline.set_edgecolor('white')
+
+            # Natural-abundance tick on the colorbar
+            if (show_natural_abundance and natural_abundance is not None
+                    and ratio_min_raw <= natural_abundance <= ratio_max_raw):
+                nat_disp = natural_abundance * scale_factor
+                cbar.ax.axhline(nat_disp, color='white', linewidth=1.4)
+                cbar.ax.axhline(nat_disp, color='black', linewidth=0.6)
+                cbar.ax.annotate(
+                    f'nat. abund.\n({nat_disp:.4g})',
+                    xy=(1.0, nat_disp), xycoords=('axes fraction', 'data'),
+                    xytext=(8, 0), textcoords='offset points',
+                    color='white', fontsize=fontsize - 2,
+                    ha='left', va='center',
+                )
 
         self._draw_scalebar(ax, field_um, sb_um, color=scalebar_color,
                             linewidth=2.5, fontsize=fontsize)

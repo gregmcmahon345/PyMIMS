@@ -271,6 +271,11 @@ def explore(img):
         style={'description_width': 'initial'},
         layout=W.Layout(width='180px'),
     )
+    zip_download_cb = W.Checkbox(
+        value=True, description='zip + download',
+        indent=False,
+        layout=W.Layout(width='180px'),
+    )
 
     # Checkbox-driven selection. Each ticked checkbox produces ONE file.
     # Group A — full multi-panel figures
@@ -518,6 +523,7 @@ def explore(img):
                     return
 
                 print(f"Exporting {len(jobs)} file(s):")
+                exported_paths = []
                 for tag, panels, grid, panel_size in jobs:
                     outpath = _export_outpath(tag)
                     img.save_publication(
@@ -528,6 +534,27 @@ def explore(img):
                         dpi=export_dpi.value,
                         format=export_format.value,
                     )
+                    exported_paths.append(outpath)
+
+                # Optional: bundle into a zip and (in Colab) trigger download
+                if zip_download_cb.value and exported_paths:
+                    import os, re, zipfile
+                    base = os.path.splitext(os.path.basename(img.path))[0]
+                    base = re.sub(r'\s*\(\d+\)$', '', base)
+                    zip_path = f"{base}_export_{export_dpi.value}dpi.zip"
+                    with zipfile.ZipFile(zip_path, 'w',
+                                         compression=zipfile.ZIP_DEFLATED) as zf:
+                        for p in exported_paths:
+                            zf.write(p, arcname=os.path.basename(p))
+                    print(f"\nZipped {len(exported_paths)} file(s) → {zip_path}")
+                    try:
+                        from google.colab import files as colab_files
+                        colab_files.download(zip_path)
+                        print("Download triggered.")
+                    except ImportError:
+                        print(f"(Not in Colab — zip saved at {zip_path})")
+                    except Exception as e:
+                        print(f"(Could not trigger download: {e})")
 
             except Exception as e:
                 import traceback
@@ -569,7 +596,7 @@ def explore(img):
 
     export_box = W.VBox([
         W.HTML("<b>Export (publication quality)</b>"),
-        W.HBox([export_format, export_dpi, export_size]),
+        W.HBox([export_format, export_dpi, export_size, zip_download_cb]),
         W.HBox([select_all_btn, clear_all_btn, export_btn]),
         W.HTML("<i>Each ticked checkbox produces one file. "
                "Multi-panel ticks produce a grouped figure; individual ticks "

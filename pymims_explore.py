@@ -271,12 +271,40 @@ def explore(img):
         style={'description_width': 'initial'},
         layout=W.Layout(width='180px'),
     )
-    export_channels_btn = W.Button(description='Export channels',
-                                   button_style='', layout=BTN_LAYOUT)
-    export_hsi_btn      = W.Button(description='Export HSI',
-                                   button_style='', layout=BTN_LAYOUT)
-    export_ratio_btn    = W.Button(description='Export ratio panels',
-                                   button_style='', layout=BTN_LAYOUT)
+
+    # Checkbox-driven selection. Each ticked checkbox produces ONE file.
+    # Group A — full multi-panel figures
+    cb_full_channels = W.Checkbox(value=False, description='Full channels figure',
+                                  indent=False)
+    cb_full_ratio    = W.Checkbox(value=False, description='Full ratio figure',
+                                  indent=False)
+
+    # Group B — individual channels (one checkbox per available mass)
+    cb_channels = [W.Checkbox(value=False, description=lab, indent=False)
+                   for lab in masses]
+
+    # Group C — individual ratio sub-panels
+    cb_ratio    = W.Checkbox(value=False, description='Ratio',     indent=False)
+    cb_delta    = W.Checkbox(value=False, description='δ',         indent=False)
+    cb_sigma    = W.Checkbox(value=False, description='σ(R)',      indent=False)
+    cb_rel_err  = W.Checkbox(value=False, description='σ(R)/R',    indent=False)
+
+    # Group D — composite
+    cb_hsi      = W.Checkbox(value=False, description='HSI',       indent=False)
+
+    # Helper buttons + main export trigger
+    select_all_btn  = W.Button(description='Select all',
+                               layout=W.Layout(width='100px'))
+    clear_all_btn   = W.Button(description='Clear all',
+                               layout=W.Layout(width='100px'))
+    export_btn      = W.Button(description='Export selected',
+                               button_style='success',
+                               layout=W.Layout(width='180px'))
+
+    # Convenience list of all checkboxes for select-all/clear-all
+    _all_checkboxes = ([cb_full_channels, cb_full_ratio]
+                       + cb_channels
+                       + [cb_ratio, cb_delta, cb_sigma, cb_rel_err, cb_hsi])
 
     # Four output panels:
     # - status: drift correction messages, errors
@@ -389,60 +417,26 @@ def explore(img):
         ext  = export_format.value
         return f"{base}_{tag}_{export_dpi.value}dpi.{ext}"
 
-    def do_export_channels(_):
-        with status_out:
-            clear_output(wait=True)
-            try:
-                # All channels in a row, matching the on-screen layout
-                panels = [{'kind': 'channel', 'channel': i,
-                           'log_scale': log_scale_cb.value}
-                          for i in range(len(masses))]
-                outpath = _export_outpath('channels')
-                img.save_publication(
-                    panels=panels,
-                    outpath=outpath,
-                    grid=(1, len(masses)),
-                    panel_size=(export_size.value, export_size.value + 1),
-                    dpi=export_dpi.value,
-                    format=export_format.value,
-                )
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
+    def _safe_label(s):
+        return s.replace(' ', '').replace('/', '_')
 
-    def do_export_hsi(_):
+    def do_select_all(_):
+        for cb in _all_checkboxes:
+            cb.value = True
+
+    def do_clear_all(_):
+        for cb in _all_checkboxes:
+            cb.value = False
+
+    def do_export(_):
         with status_out:
             clear_output(wait=True)
             try:
+                # Resolve current numerator/denominator labels
                 num = num_dd.value; den = den_dd.value
                 num_lab = masses[num]; den_lab = masses[den]
-                tag = ('hsi_' +
-                       num_lab.replace(' ', '') + '_over_' +
-                       den_lab.replace(' ', ''))
-                outpath = _export_outpath(tag)
-                img.save_publication(
-                    {'kind': 'hsi',
-                     'numerator': num, 'denominator': den,
-                     'intensity': hsi_intensity.value,
-                     'cmap': hsi_cmap.value,
-                     'cmap_reverse': hsi_cmap_reverse.value,
-                     'min_counts': min_counts.value if min_counts.value > 0 else None,
-                    },
-                    outpath=outpath,
-                    panel_size=(export_size.value, export_size.value),
-                    dpi=export_dpi.value,
-                    format=export_format.value,
-                )
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
+                pair_tag = f"{_safe_label(num_lab)}_over_{_safe_label(den_lab)}"
 
-    def do_export_ratio(_):
-        with status_out:
-            clear_output(wait=True)
-            try:
-                num = num_dd.value; den = den_dd.value
-                num_lab = masses[num]; den_lab = masses[den]
                 # Resolve δ reference like do_plot does
                 delta_ref = None
                 if delta_text.value.strip():
@@ -452,27 +446,89 @@ def explore(img):
                     auto, _ = _lookup_ref(num_lab, den_lab)
                     if auto is not None: delta_ref = auto
 
-                common = {'numerator': num, 'denominator': den,
-                          'min_counts': min_counts.value if min_counts.value > 0 else None,
-                          'max_rel_err': max_rel.value if max_rel.value > 0 else None}
-                panels = [
-                    {'kind': 'ratio',   **common},
-                    {'kind': 'delta',   'delta_ref': delta_ref, **common},
-                    {'kind': 'sigma',   **common},
-                    {'kind': 'rel_err', **common},
-                ]
-                tag = ('ratio_' +
-                       num_lab.replace(' ', '') + '_over_' +
-                       den_lab.replace(' ', ''))
-                outpath = _export_outpath(tag)
-                img.save_publication(
-                    panels=panels,
-                    outpath=outpath,
-                    grid=(2, 2),
-                    panel_size=(export_size.value, export_size.value),
-                    dpi=export_dpi.value,
-                    format=export_format.value,
-                )
+                common_ratio_kw = {
+                    'numerator': num, 'denominator': den,
+                    'min_counts': min_counts.value if min_counts.value > 0 else None,
+                    'max_rel_err': max_rel.value if max_rel.value > 0 else None,
+                }
+
+                # Build a list of (label, panels-spec, grid, extra-suffix) jobs
+                # from ticked checkboxes. Each job becomes one exported file.
+                jobs = []
+
+                if cb_full_channels.value:
+                    panels = [{'kind': 'channel', 'channel': i,
+                               'log_scale': log_scale_cb.value}
+                              for i in range(len(masses))]
+                    jobs.append(('channels_all',
+                                 panels, (1, len(masses)),
+                                 (export_size.value, export_size.value + 1)))
+
+                if cb_full_ratio.value:
+                    panels = [
+                        {'kind': 'ratio',   **common_ratio_kw},
+                        {'kind': 'delta',   'delta_ref': delta_ref, **common_ratio_kw},
+                        {'kind': 'sigma',   **common_ratio_kw},
+                        {'kind': 'rel_err', **common_ratio_kw},
+                    ]
+                    jobs.append((f'ratio_all_{pair_tag}',
+                                 panels, (2, 2),
+                                 (export_size.value, export_size.value)))
+
+                # Individual channels
+                for i, cb in enumerate(cb_channels):
+                    if cb.value:
+                        panels = [{'kind': 'channel', 'channel': i,
+                                   'log_scale': log_scale_cb.value}]
+                        jobs.append((f'channel_{_safe_label(masses[i])}',
+                                     panels, (1, 1),
+                                     (export_size.value, export_size.value)))
+
+                # Individual ratio panels
+                for cb, kind, label in [
+                    (cb_ratio,   'ratio',   'ratio'),
+                    (cb_delta,   'delta',   'delta'),
+                    (cb_sigma,   'sigma',   'sigma'),
+                    (cb_rel_err, 'rel_err', 'relerr'),
+                ]:
+                    if cb.value:
+                        spec = {'kind': kind, **common_ratio_kw}
+                        if kind == 'delta':
+                            spec['delta_ref'] = delta_ref
+                        jobs.append((f'{label}_{pair_tag}',
+                                     [spec], (1, 1),
+                                     (export_size.value, export_size.value)))
+
+                # HSI
+                if cb_hsi.value:
+                    spec = {
+                        'kind': 'hsi',
+                        'numerator': num, 'denominator': den,
+                        'intensity': hsi_intensity.value,
+                        'cmap': hsi_cmap.value,
+                        'cmap_reverse': hsi_cmap_reverse.value,
+                        'min_counts': min_counts.value if min_counts.value > 0 else None,
+                    }
+                    jobs.append((f'hsi_{pair_tag}',
+                                 [spec], (1, 1),
+                                 (export_size.value, export_size.value)))
+
+                if not jobs:
+                    print("Nothing selected — tick at least one checkbox above.")
+                    return
+
+                print(f"Exporting {len(jobs)} file(s):")
+                for tag, panels, grid, panel_size in jobs:
+                    outpath = _export_outpath(tag)
+                    img.save_publication(
+                        panels=panels,
+                        outpath=outpath,
+                        grid=grid,
+                        panel_size=panel_size,
+                        dpi=export_dpi.value,
+                        format=export_format.value,
+                    )
+
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -481,9 +537,9 @@ def explore(img):
     channels_button.on_click(do_channels)
     plot_button.on_click(do_plot)
     hsi_button.on_click(do_hsi)
-    export_channels_btn.on_click(do_export_channels)
-    export_hsi_btn.on_click(do_export_hsi)
-    export_ratio_btn.on_click(do_export_ratio)
+    select_all_btn.on_click(do_select_all)
+    clear_all_btn.on_click(do_clear_all)
+    export_btn.on_click(do_export)
 
     drift_box = W.VBox([
         W.HTML("<b>Drift correction</b>"),
@@ -498,10 +554,34 @@ def explore(img):
         W.HTML("<b>HSI</b> <small>(uses Numerator / Denominator from Ratio panel)</small>"),
         hsi_intensity, hsi_cmap, hsi_cmap_reverse, hsi_button,
     ])
+
+    # Export panel — checkbox-driven, one ticked checkbox = one exported file
+    # Each row of channels uses up to 4 columns to keep the layout compact.
+    channel_rows = []
+    row = []
+    for i, cb in enumerate(cb_channels):
+        row.append(cb)
+        if len(row) == 4:
+            channel_rows.append(W.HBox(row))
+            row = []
+    if row:
+        channel_rows.append(W.HBox(row))
+
     export_box = W.VBox([
         W.HTML("<b>Export (publication quality)</b>"),
         W.HBox([export_format, export_dpi, export_size]),
-        W.HBox([export_channels_btn, export_hsi_btn, export_ratio_btn]),
+        W.HBox([select_all_btn, clear_all_btn, export_btn]),
+        W.HTML("<i>Each ticked checkbox produces one file. "
+               "Multi-panel ticks produce a grouped figure; individual ticks "
+               "produce single-panel figures.</i>"),
+        W.HTML("<b>Full figures (multi-panel):</b>"),
+        W.HBox([cb_full_channels, cb_full_ratio]),
+        W.HTML("<b>Channels (individual):</b>"),
+        *channel_rows,
+        W.HTML("<b>Ratio panels (individual; uses Numerator / Denominator above):</b>"),
+        W.HBox([cb_ratio, cb_delta, cb_sigma, cb_rel_err]),
+        W.HTML("<b>Composite:</b>"),
+        cb_hsi,
     ])
 
     display(W.HBox([drift_box, ratio_box, hsi_box]))

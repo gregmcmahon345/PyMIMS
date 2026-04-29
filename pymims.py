@@ -1,5 +1,5 @@
 """
-pymims.py  v0.4
+pymims.py  v0.5
 ===============================================================================
 DEVELOPMENT STATUS: Early prototype — not a public package.
 This library is an original work in development and is NOT available on PyPI
@@ -8,8 +8,8 @@ or any public repository. Do not distribute without the author's permission.
 
 Authors   : G. McMahon (principal scientist) with AI-assisted development
 Created   : March 2026
-Updated   : April 2026 (v0.4 — HSI composite, log scale for channels)
-Status    : v0.4 prototype
+Updated   : April 2026 (v0.5 — publication-quality export, multi-panel layout)
+Status    : v0.5 prototype
 
 Description
 -----------
@@ -1097,6 +1097,416 @@ class MimsImage:
         }
         _finalize_figure(fig, outpath, show)
         return fig, info
+
+    # ── Publication-quality export ───────────────────────────────────────────
+
+    def _draw_scalebar(self, ax, field_um, sb_um, color='white',
+                       linewidth=2.5, fontsize=9):
+        """Draw a scale bar with end ticks and label on the given axes."""
+        margin = field_um * 0.05
+        bar_y  = field_um - margin
+        bar_x0 = margin
+        bar_x1 = margin + sb_um
+        tick_h = field_um * 0.02
+        ax.plot([bar_x0, bar_x1], [bar_y, bar_y], '-',
+                color=color, linewidth=linewidth, solid_capstyle='butt')
+        for xp in [bar_x0, bar_x1]:
+            ax.plot([xp, xp], [bar_y - tick_h, bar_y + tick_h],
+                    '-', color=color, linewidth=max(1.5, linewidth - 0.5))
+        ax.text((bar_x0 + bar_x1) / 2, bar_y - tick_h * 2,
+                f'{sb_um:g} μm', color=color,
+                fontsize=fontsize, ha='center', va='bottom')
+
+    def _render_channel_panel(self, ax, channel, *, fig=None,
+                              corrected=True, plane=None, cmap='gray',
+                              log_scale=False, scalebar_color='white',
+                              percentile=99.5, fontsize=9, title=None,
+                              cbar_label=True):
+        """Render a single channel image onto a given matplotlib Axes."""
+        from matplotlib.colors import SymLogNorm
+        ch = self._resolve_channel(channel)
+        if corrected and self.corrected is not None:
+            arr = self.corrected
+        else:
+            arr = self.data.astype(float)
+
+        if plane is None:
+            data = arr[:, ch].sum(axis=0)
+        else:
+            data = arr[plane, ch]
+
+        field_um = self.metadata['field_um']
+        sb_um    = self._nice_scalebar(field_um)
+        p99      = np.percentile(data, percentile) if data.max() > 0 else 1
+
+        if log_scale:
+            norm = SymLogNorm(linthresh=1.0, linscale=1.0,
+                              vmin=0, vmax=max(p99, 2))
+            im = ax.imshow(data, cmap=cmap, norm=norm,
+                           extent=[0, field_um, field_um, 0],
+                           interpolation='nearest')
+        else:
+            im = ax.imshow(data, cmap=cmap, vmin=0, vmax=p99,
+                           extent=[0, field_um, field_um, 0],
+                           interpolation='nearest')
+
+        ax.set_title(title if title is not None else self.masses[ch],
+                     color='white', fontsize=fontsize + 1,
+                     fontweight='bold', pad=4)
+        ax.set_facecolor('#1a1a1a')
+        ax.axis('off')
+        ax.set_xlim(0, field_um); ax.set_ylim(field_um, 0)
+
+        # Colorbar
+        if fig is not None:
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+            if cbar_label:
+                cbar.set_label('Counts (log)' if log_scale else 'Counts',
+                               color='white', fontsize=fontsize)
+            cbar.ax.yaxis.set_tick_params(color='white', labelcolor='white',
+                                          labelsize=fontsize - 1)
+            cbar.outline.set_edgecolor('white')
+            if not log_scale:
+                cbar.locator = ticker.MaxNLocator(nbins=5, integer=True)
+                cbar.update_ticks()
+
+        self._draw_scalebar(ax, field_um, sb_um, color=scalebar_color,
+                            linewidth=2.5, fontsize=fontsize)
+        return im
+
+    def _render_ratio_panel(self, ax, *, fig=None, kind='ratio',
+                            numerator=None, denominator=None,
+                            delta_ref=None, min_counts=None, max_rel_err=None,
+                            cmap=None, scalebar_color='white',
+                            percentile=(1, 99), delta_range=None,
+                            fontsize=9, title=None,
+                            precomputed=None):
+        """Render one of {ratio, delta, sigma, rel_err} onto a given Axes.
+
+        If `precomputed` is a dict from a previous ratio() call, reuse it
+        rather than recomputing. Saves work when rendering several panels
+        from the same A/B pair.
+        """
+        if precomputed is None:
+            precomputed = self.ratio(numerator, denominator,
+                                     min_counts=min_counts,
+                                     max_rel_err=max_rel_err)
+        R       = precomputed['ratio']
+        sigma   = precomputed['sigma']
+        rel_err = precomputed['rel_err']
+        num_lab = precomputed['num_label']
+        den_lab = precomputed['den_label']
+        field_um = self.metadata['field_um']
+        sb_um    = self._nice_scalebar(field_um)
+
+        # Prepare image and colour scale by panel kind
+        if kind == 'ratio':
+            img_data = R
+            cmap_use = cmap or 'viridis'
+            xf       = img_data[np.isfinite(img_data)]
+            vmin     = float(np.percentile(xf, percentile[0])) if xf.size else 0
+            vmax     = float(np.percentile(xf, percentile[1])) if xf.size else 1
+            cbar_label = ''
+            panel_title = title or f'Ratio  {num_lab}/{den_lab}'
+
+        elif kind == 'delta':
+            if delta_ref is None:
+                ref = float(np.nanmedian(R))
+                ref_label = f'image median ({ref:.4g})'
+            else:
+                ref = float(delta_ref)
+                ref_label = f'{ref:.4g}'
+            img_data = (R / ref - 1.0) * 1000.0
+            cmap_use = cmap or 'RdBu_r'
+            if delta_range is None:
+                d_finite = img_data[np.isfinite(img_data)]
+                mad = np.median(np.abs(d_finite - np.median(d_finite)))
+                sd_robust = 1.4826 * mad if mad > 0 else np.nanstd(d_finite)
+                delta_range = max(2 * sd_robust, 1.0)
+            vmin, vmax = -delta_range, delta_range
+            cbar_label = '‰'
+            panel_title = title or f'δ vs {ref_label} (‰)'
+
+        elif kind == 'sigma':
+            img_data = sigma
+            cmap_use = cmap or 'magma'
+            xf = img_data[np.isfinite(img_data)]
+            vmin = float(np.percentile(xf, percentile[0])) if xf.size else 0
+            vmax = float(np.percentile(xf, percentile[1])) if xf.size else 1
+            cbar_label = ''
+            panel_title = title or f'σ(R)  {num_lab}/{den_lab}'
+
+        elif kind == 'rel_err':
+            img_data = rel_err
+            cmap_use = cmap or 'magma'
+            xf = img_data[np.isfinite(img_data)]
+            vmin = float(np.percentile(xf, percentile[0])) if xf.size else 0
+            vmax = float(np.percentile(xf, percentile[1])) if xf.size else 1
+            vmax = min(vmax, 1.0)
+            if vmin >= vmax: vmin = 0.0
+            cbar_label = ''
+            panel_title = title or f'σ(R)/R  {num_lab}/{den_lab}'
+
+        else:
+            raise ValueError(f"Unknown ratio panel kind: {kind!r}")
+
+        im = ax.imshow(img_data, cmap=cmap_use, vmin=vmin, vmax=vmax,
+                       extent=[0, field_um, field_um, 0],
+                       interpolation='nearest')
+        ax.set_title(panel_title, color='white', fontsize=fontsize + 1,
+                     fontweight='bold', pad=4)
+        ax.set_facecolor('#1a1a1a')
+        ax.axis('off')
+        ax.set_xlim(0, field_um); ax.set_ylim(field_um, 0)
+
+        if fig is not None:
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+            if cbar_label:
+                cbar.set_label(cbar_label, color='white', fontsize=fontsize)
+            cbar.ax.yaxis.set_tick_params(color='white', labelcolor='white',
+                                          labelsize=fontsize - 1)
+            cbar.outline.set_edgecolor('white')
+
+        self._draw_scalebar(ax, field_um, sb_um, color=scalebar_color,
+                            linewidth=2.5, fontsize=fontsize)
+        return precomputed
+
+    def _render_hsi_panel(self, ax, *, fig=None, numerator=None,
+                          denominator=None, intensity='denominator',
+                          cmap='viridis', cmap_reverse=False,
+                          ratio_min=None, ratio_max=None,
+                          intensity_percentile=(1, 99.5),
+                          min_counts=None, scalebar_color='white',
+                          fontsize=9, title=None):
+        """Render an HSI composite onto a given Axes."""
+        from matplotlib.colors import Normalize
+        from matplotlib.cm import ScalarMappable
+
+        cmap_alias = {
+            'rainbow': 'hsv',
+            'classic_openmims': 'jet', 'classic openmims': 'jet',
+            'Classic OpenMIMS': 'jet', 'Classic OpenMIMS LUT': 'jet',
+        }
+        cmap_name = cmap_alias.get(cmap, cmap)
+        if cmap_reverse and not cmap_name.endswith('_r'):
+            cmap_name = cmap_name + '_r'
+
+        result  = self.ratio(numerator, denominator, min_counts=min_counts)
+        R       = result['ratio']
+        A       = result['A']; B = result['B']
+        num_lab = result['num_label']; den_lab = result['den_label']
+
+        if intensity == 'denominator':
+            I = B
+        elif intensity == 'numerator':
+            I = A
+        elif intensity == 'sum':
+            I = A + B
+        else:
+            raise ValueError(f"intensity must be 'denominator', 'numerator', "
+                             f"or 'sum'; got {intensity!r}")
+
+        finite = np.isfinite(R)
+        if not finite.any():
+            raise ValueError("No valid pixels in HSI panel.")
+        if ratio_min is None: ratio_min = float(np.percentile(R[finite], 1))
+        if ratio_max is None: ratio_max = float(np.percentile(R[finite], 99))
+        if ratio_max <= ratio_min: ratio_max = ratio_min + 1e-12
+
+        R_norm = np.clip((R - ratio_min) / (ratio_max - ratio_min), 0, 1)
+        R_norm = np.where(np.isnan(R_norm), 0, R_norm)
+        cmap_obj = plt.get_cmap(cmap_name)
+        rgb = cmap_obj(R_norm)[:, :, :3]
+
+        I_finite = I[np.isfinite(I) & (I > 0)]
+        if I_finite.size > 0:
+            i_lo, i_hi = np.percentile(I_finite,
+                                       [intensity_percentile[0],
+                                        intensity_percentile[1]])
+        else:
+            i_lo, i_hi = 0, 1
+        if i_hi <= i_lo: i_hi = i_lo + 1
+        I_norm = np.clip((I - i_lo) / (i_hi - i_lo), 0, 1)
+
+        mask = np.isfinite(R) & np.isfinite(I)
+        if min_counts is not None: mask &= (B >= min_counts)
+        I_norm = np.where(mask, I_norm, 0)
+
+        hsi_rgb = np.clip(rgb * I_norm[:, :, None], 0, 1)
+
+        field_um = self.metadata['field_um']
+        sb_um    = self._nice_scalebar(field_um)
+
+        ax.imshow(hsi_rgb, extent=[0, field_um, field_um, 0],
+                  interpolation='nearest')
+        ax.set_title(title or f'HSI  {num_lab}/{den_lab}',
+                     color='white', fontsize=fontsize + 1,
+                     fontweight='bold', pad=4)
+        ax.set_facecolor('#1a1a1a')
+        ax.axis('off')
+        ax.set_xlim(0, field_um); ax.set_ylim(field_um, 0)
+
+        if fig is not None:
+            sm = ScalarMappable(norm=Normalize(vmin=ratio_min, vmax=ratio_max),
+                                cmap=cmap_obj)
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.03)
+            cbar.set_label(f'{num_lab}/{den_lab}', color='white',
+                           fontsize=fontsize)
+            cbar.ax.yaxis.set_tick_params(color='white', labelcolor='white',
+                                          labelsize=fontsize - 1)
+            cbar.outline.set_edgecolor('white')
+
+        self._draw_scalebar(ax, field_um, sb_um, color=scalebar_color,
+                            linewidth=2.5, fontsize=fontsize)
+
+    def save_publication(self, panels, outpath, *,
+                         grid=None, panel_size=(4, 4),
+                         dpi=600, format=None, suptitle=None,
+                         fontsize=9):
+        """
+        Save a publication-quality figure as PNG or TIFF.
+
+        Parameters
+        ----------
+        panels : list of dict, or single dict
+            Each dict specifies one panel:
+              {'kind': 'channel',  'channel': '12C 14N', ...}
+              {'kind': 'ratio',    'numerator': '12C 15N',
+                                   'denominator': '12C 14N', ...}
+              {'kind': 'delta',    'numerator': ..., 'denominator': ...,
+                                   'delta_ref': ...}
+              {'kind': 'sigma',    'numerator': ..., 'denominator': ...}
+              {'kind': 'rel_err',  'numerator': ..., 'denominator': ...}
+              {'kind': 'hsi',      'numerator': ..., 'denominator': ...,
+                                   'cmap': 'Classic OpenMIMS LUT', ...}
+            Each dict can include any kwargs the corresponding renderer
+            accepts (cmap, min_counts, log_scale, scalebar_color, title, etc.).
+        outpath : str
+            Output filename. Extension determines format if `format` is None
+            (.png → PNG, .tif/.tiff → TIFF).
+        grid : (rows, cols) or None
+            Grid layout. If None, auto-picks a near-square arrangement.
+        panel_size : (w, h)
+            Inches per panel. Total figure size is grid * panel_size.
+        dpi : int
+            Output resolution (default 600 — publication quality).
+        format : 'png' or 'tif' or None
+            Override format, otherwise inferred from outpath extension.
+        suptitle : str or None
+            Optional figure-wide title.
+        fontsize : int
+            Base font size in points (default 9). Titles use fontsize+1,
+            tick labels use fontsize-1.
+
+        Examples
+        --------
+        # Single HSI panel:
+        img.save_publication(
+            {'kind': 'hsi', 'numerator': '12C 15N', 'denominator': '12C 14N',
+             'cmap': 'Classic OpenMIMS LUT'},
+            'figure_hsi.png', dpi=600)
+
+        # Multi-panel grid: ¹²C¹⁴N channel, HSI, δ panel:
+        img.save_publication(
+            panels=[
+                {'kind': 'channel', 'channel': '12C 14N', 'log_scale': True},
+                {'kind': 'hsi',     'numerator': '12C 15N',
+                                    'denominator': '12C 14N',
+                                    'cmap': 'Classic OpenMIMS LUT'},
+                {'kind': 'delta',   'numerator': '12C 15N',
+                                    'denominator': '12C 14N',
+                                    'delta_ref': 0.0036765},
+            ],
+            outpath='figure_3panel.tif',
+            grid=(1, 3),
+            panel_size=(3.5, 3.5),
+            dpi=600,
+        )
+        """
+        # Normalise inputs
+        if isinstance(panels, dict):
+            panels = [panels]
+        n = len(panels)
+        if n == 0:
+            raise ValueError("panels must contain at least one panel.")
+
+        # Auto-grid: prefer wider than tall, near-square
+        if grid is None:
+            cols = int(np.ceil(np.sqrt(n)))
+            rows = int(np.ceil(n / cols))
+            grid = (rows, cols)
+        rows, cols = grid
+        if rows * cols < n:
+            raise ValueError(f"grid {grid} too small for {n} panels.")
+
+        # Format inference
+        if format is None:
+            ext = os.path.splitext(outpath)[1].lower().lstrip('.')
+            format = 'tiff' if ext in ('tif', 'tiff') else 'png'
+        format = format.lower()
+        if format in ('tif',): format = 'tiff'
+        if format not in ('png', 'tiff'):
+            raise ValueError("format must be 'png' or 'tiff'.")
+
+        bg = '#1a1a1a'
+        fig_w = panel_size[0] * cols
+        fig_h = panel_size[1] * rows
+        fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h),
+                                 facecolor=bg, squeeze=False)
+
+        # Cache ratio() outputs so multi-panel ratio figures reuse the work
+        ratio_cache = {}
+
+        for idx, spec in enumerate(panels):
+            r, c = idx // cols, idx % cols
+            ax = axes[r][c]
+            kind = spec.get('kind')
+            kw = {k: v for k, v in spec.items() if k != 'kind'}
+
+            if kind == 'channel':
+                self._render_channel_panel(ax, fig=fig, fontsize=fontsize, **kw)
+
+            elif kind in ('ratio', 'delta', 'sigma', 'rel_err'):
+                cache_key = (kw.get('numerator'), kw.get('denominator'),
+                             kw.get('min_counts'), kw.get('max_rel_err'))
+                kw.setdefault('precomputed', ratio_cache.get(cache_key))
+                result = self._render_ratio_panel(ax, fig=fig, kind=kind,
+                                                  fontsize=fontsize, **kw)
+                ratio_cache[cache_key] = result
+
+            elif kind == 'hsi':
+                self._render_hsi_panel(ax, fig=fig, fontsize=fontsize, **kw)
+
+            else:
+                raise ValueError(f"Unknown panel kind: {kind!r}")
+
+        # Hide any unused axes
+        for idx in range(n, rows * cols):
+            r, c = idx // cols, idx % cols
+            axes[r][c].axis('off')
+            axes[r][c].set_facecolor(bg)
+
+        if suptitle:
+            fig.suptitle(suptitle, color='white', fontsize=fontsize + 2,
+                         y=0.995)
+
+        plt.tight_layout()
+
+        # Save with publication-grade options
+        save_kw = {'dpi': dpi, 'bbox_inches': 'tight',
+                   'facecolor': fig.get_facecolor()}
+        if format == 'tiff':
+            save_kw['format'] = 'tiff'
+            save_kw['pil_kwargs'] = {'compression': 'tiff_lzw'}
+        else:
+            save_kw['format'] = 'png'
+
+        fig.savefig(outpath, **save_kw)
+        plt.close(fig)
+        print(f"Saved publication figure: {outpath}  "
+              f"({rows}×{cols} panels, {fig_w:.1f}×{fig_h:.1f}\" @ {dpi} dpi)")
+        return outpath
 
     # ── Data access ──────────────────────────────────────────────────────────
 

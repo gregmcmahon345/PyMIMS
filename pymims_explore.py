@@ -253,6 +253,31 @@ def explore(img):
     hsi_button = W.Button(description='Plot HSI', button_style='primary',
                           layout=BTN_LAYOUT)
 
+    # ── Export controls (publication-quality) ──────────────────────────────
+    export_format = W.Dropdown(
+        options=['png', 'tiff'], value='png',
+        description='format:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='150px'),
+    )
+    export_dpi = W.Dropdown(
+        options=[300, 600, 1200], value=600,
+        description='dpi:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='150px'),
+    )
+    export_size = W.FloatText(
+        value=4.0, description='panel size (in):',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='180px'),
+    )
+    export_channels_btn = W.Button(description='Export channels',
+                                   button_style='', layout=BTN_LAYOUT)
+    export_hsi_btn      = W.Button(description='Export HSI',
+                                   button_style='', layout=BTN_LAYOUT)
+    export_ratio_btn    = W.Button(description='Export ratio panels',
+                                   button_style='', layout=BTN_LAYOUT)
+
     # Four output panels:
     # - status: drift correction messages, errors
     # - channels_out: all-channels plot (pinned, only changes on demand)
@@ -355,10 +380,110 @@ def explore(img):
                 import traceback
                 traceback.print_exc()
 
+    def _export_outpath(tag):
+        """Build a default filename for an export."""
+        import os, re
+        base = os.path.splitext(os.path.basename(img.path))[0]
+        # Drop trailing " (1)" etc. from Colab re-uploads
+        base = re.sub(r'\s*\(\d+\)$', '', base)
+        ext  = export_format.value
+        return f"{base}_{tag}_{export_dpi.value}dpi.{ext}"
+
+    def do_export_channels(_):
+        with status_out:
+            clear_output(wait=True)
+            try:
+                # All channels in a row, matching the on-screen layout
+                panels = [{'kind': 'channel', 'channel': i,
+                           'log_scale': log_scale_cb.value}
+                          for i in range(len(masses))]
+                outpath = _export_outpath('channels')
+                img.save_publication(
+                    panels=panels,
+                    outpath=outpath,
+                    grid=(1, len(masses)),
+                    panel_size=(export_size.value, export_size.value + 1),
+                    dpi=export_dpi.value,
+                    format=export_format.value,
+                )
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+
+    def do_export_hsi(_):
+        with status_out:
+            clear_output(wait=True)
+            try:
+                num = num_dd.value; den = den_dd.value
+                num_lab = masses[num]; den_lab = masses[den]
+                tag = ('hsi_' +
+                       num_lab.replace(' ', '') + '_over_' +
+                       den_lab.replace(' ', ''))
+                outpath = _export_outpath(tag)
+                img.save_publication(
+                    {'kind': 'hsi',
+                     'numerator': num, 'denominator': den,
+                     'intensity': hsi_intensity.value,
+                     'cmap': hsi_cmap.value,
+                     'cmap_reverse': hsi_cmap_reverse.value,
+                     'min_counts': min_counts.value if min_counts.value > 0 else None,
+                    },
+                    outpath=outpath,
+                    panel_size=(export_size.value, export_size.value),
+                    dpi=export_dpi.value,
+                    format=export_format.value,
+                )
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+
+    def do_export_ratio(_):
+        with status_out:
+            clear_output(wait=True)
+            try:
+                num = num_dd.value; den = den_dd.value
+                num_lab = masses[num]; den_lab = masses[den]
+                # Resolve δ reference like do_plot does
+                delta_ref = None
+                if delta_text.value.strip():
+                    try: delta_ref = float(delta_text.value)
+                    except ValueError: pass
+                else:
+                    auto, _ = _lookup_ref(num_lab, den_lab)
+                    if auto is not None: delta_ref = auto
+
+                common = {'numerator': num, 'denominator': den,
+                          'min_counts': min_counts.value if min_counts.value > 0 else None,
+                          'max_rel_err': max_rel.value if max_rel.value > 0 else None}
+                panels = [
+                    {'kind': 'ratio',   **common},
+                    {'kind': 'delta',   'delta_ref': delta_ref, **common},
+                    {'kind': 'sigma',   **common},
+                    {'kind': 'rel_err', **common},
+                ]
+                tag = ('ratio_' +
+                       num_lab.replace(' ', '') + '_over_' +
+                       den_lab.replace(' ', ''))
+                outpath = _export_outpath(tag)
+                img.save_publication(
+                    panels=panels,
+                    outpath=outpath,
+                    grid=(2, 2),
+                    panel_size=(export_size.value, export_size.value),
+                    dpi=export_dpi.value,
+                    format=export_format.value,
+                )
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+
     drift_button.on_click(do_drift)
     channels_button.on_click(do_channels)
     plot_button.on_click(do_plot)
     hsi_button.on_click(do_hsi)
+    export_channels_btn.on_click(do_export_channels)
+    export_hsi_btn.on_click(do_export_hsi)
+    export_ratio_btn.on_click(do_export_ratio)
 
     drift_box = W.VBox([
         W.HTML("<b>Drift correction</b>"),
@@ -373,8 +498,14 @@ def explore(img):
         W.HTML("<b>HSI</b> <small>(uses Numerator / Denominator from Ratio panel)</small>"),
         hsi_intensity, hsi_cmap, hsi_cmap_reverse, hsi_button,
     ])
+    export_box = W.VBox([
+        W.HTML("<b>Export (publication quality)</b>"),
+        W.HBox([export_format, export_dpi, export_size]),
+        W.HBox([export_channels_btn, export_hsi_btn, export_ratio_btn]),
+    ])
 
     display(W.HBox([drift_box, ratio_box, hsi_box]))
+    display(export_box)
     display(status_out)
     display(channels_out)
     display(hsi_out)

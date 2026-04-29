@@ -922,9 +922,10 @@ class MimsImage:
               'viridis'  — perceptually uniform, recommended scientific default
               'plasma', 'inferno', 'magma' — perceptually uniform alternatives
               'twilight' — isoluminant, suited to HSI where hue alone matters
-              'rainbow'  — alias for 'hsv', OpenMIMS-compatible classic
+              'rainbow'  — alias for 'hsv'
               'hsv'      — same as 'rainbow', explicit name
-              'jet'      — old-school rainbow (not recommended scientifically)
+              'classic_openmims', 'classic openmims', 'jet'
+                         — the classic OpenMIMS rainbow LUT (matplotlib jet)
         cmap_reverse : bool
             Reverse the colourmap (equivalent to using a `_r` suffix).
         ratio_min, ratio_max : float or None
@@ -946,7 +947,13 @@ class MimsImage:
             info : dict with ratio, intensity, mask, ratio_range, cmap_name
         """
         # Map our cmap aliases
-        cmap_alias = {'rainbow': 'hsv'}
+        cmap_alias = {
+            'rainbow'         : 'hsv',
+            'classic_openmims': 'jet',
+            'classic openmims': 'jet',
+            'Classic OpenMIMS': 'jet',
+            'Classic OpenMIMS LUT': 'jet',
+        }
         cmap_name = cmap_alias.get(cmap, cmap)
         if cmap_reverse and not cmap_name.endswith('_r'):
             cmap_name = cmap_name + '_r'
@@ -1033,10 +1040,10 @@ class MimsImage:
         field_um = self.metadata['field_um']
         sb_um    = self._nice_scalebar(field_um)
 
-        fig = plt.figure(figsize=(8, 7), facecolor=bg)
+        fig = plt.figure(figsize=(5, 5), facecolor=bg)
         # Main image axis + a thin colourbar axis on the right
-        ax       = fig.add_axes([0.05, 0.08, 0.78, 0.84])
-        cbar_ax  = fig.add_axes([0.85, 0.08, 0.03, 0.84])
+        ax       = fig.add_axes([0.05, 0.08, 0.74, 0.84])
+        cbar_ax  = fig.add_axes([0.82, 0.08, 0.04, 0.84])
 
         ax.imshow(hsi_rgb, extent=[0, field_um, field_um, 0],
                   interpolation='nearest')
@@ -1073,13 +1080,13 @@ class MimsImage:
                                       labelsize=8)
         cbar.outline.set_edgecolor('white')
 
-        # Title
-        title = (f"{os.path.basename(self.path)}  |  "
-                 f"HSI {num_lab}/{den_lab}  |  "
+        # Title (kept compact for the smaller figure)
+        title = (f"HSI {num_lab}/{den_lab}  |  "
                  f"intensity: {intensity_label}  |  "
-                 f"cmap: {cmap}{'_r' if cmap_reverse else ''}  |  "
-                 f"hue range: {ratio_min:.4g}–{ratio_max:.4g}")
-        fig.suptitle(title, color='white', fontsize=10, y=0.98)
+                 f"cmap: {cmap}{'_r' if cmap_reverse else ''}\n"
+                 f"hue range: {ratio_min:.4g}–{ratio_max:.4g}  |  "
+                 f"{os.path.basename(self.path)}")
+        fig.suptitle(title, color='white', fontsize=8, y=0.98)
 
         info = {
             'ratio'      : R,

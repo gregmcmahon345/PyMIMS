@@ -174,55 +174,72 @@ def explore(img):
     # expects this order. Value is the channel index.
     channel_options = [(f"[{i}] {lab}", i) for i, lab in enumerate(masses)]
 
+    # Compact widget layouts so the controls don't dominate the page.
+    DROP_LAYOUT = W.Layout(width='220px')
+    SLIDER_LAYOUT = W.Layout(width='220px')
+    BTN_LAYOUT = W.Layout(width='150px')
+    SHORT_BTN = W.Layout(width='115px')
+
     # ── Drift correction controls ───────────────────────────────────────────
     drift_ref = W.Dropdown(
         options=channel_options,
         value=0,
         description='Drift ref:',
         style={'description_width': 'initial'},
+        layout=DROP_LAYOUT,
     )
     bin_planes = W.IntSlider(
         value=1, min=1, max=max(2, img.metadata['n_planes'] // 2),
         step=1, description='bin_planes:',
         style={'description_width': 'initial'},
         continuous_update=False,
+        layout=SLIDER_LAYOUT,
     )
     bin_apply = W.Dropdown(
         options=['same', 'interp', 'super'],
         value='same', description='bin_apply:',
         style={'description_width': 'initial'},
+        layout=DROP_LAYOUT,
     )
     drift_button = W.Button(description='Re-do drift correction',
-                            button_style='warning')
+                            button_style='warning', layout=BTN_LAYOUT)
     channels_button = W.Button(description='Show channels',
-                               button_style='info')
+                               button_style='info', layout=SHORT_BTN)
     log_scale_cb = W.Checkbox(value=False, description='log scale',
                               indent=False)
 
     # ── Ratio controls ──────────────────────────────────────────────────────
     num_dd = W.Dropdown(options=channel_options, value=0,
                         description='Numerator:',
-                        style={'description_width': 'initial'})
+                        style={'description_width': 'initial'},
+                        layout=DROP_LAYOUT)
     den_dd = W.Dropdown(options=channel_options,
                         value=min(1, len(masses) - 1),
                         description='Denominator:',
-                        style={'description_width': 'initial'})
-    delta_text = W.Text(value='', placeholder='auto if known pair, else median',
+                        style={'description_width': 'initial'},
+                        layout=DROP_LAYOUT)
+    delta_text = W.Text(value='', placeholder='auto, else median',
                         description='δ ref:',
-                        style={'description_width': 'initial'})
+                        style={'description_width': 'initial'},
+                        layout=W.Layout(width='220px'))
     min_counts = W.FloatText(value=0, description='min_counts (B≥):',
-                             style={'description_width': 'initial'})
+                             style={'description_width': 'initial'},
+                             layout=W.Layout(width='200px'))
     max_rel = W.FloatText(value=0, description='max σ/R:',
-                          style={'description_width': 'initial'})
-    plot_button = W.Button(description='Plot ratio', button_style='success')
+                          style={'description_width': 'initial'},
+                          layout=W.Layout(width='200px'))
+    plot_button = W.Button(description='Plot ratio', button_style='success',
+                           layout=BTN_LAYOUT)
 
     # ── HSI controls ────────────────────────────────────────────────────────
+    # Display labels are user-friendly; the library handles the alias mapping.
     hsi_cmap = W.Dropdown(
         options=['viridis', 'plasma', 'inferno', 'magma', 'twilight',
-                 'rainbow', 'jet'],
+                 'rainbow', 'Classic OpenMIMS LUT'],
         value='viridis',
         description='cmap:',
         style={'description_width': 'initial'},
+        layout=DROP_LAYOUT,
     )
     hsi_cmap_reverse = W.Checkbox(value=False, description='reverse',
                                   indent=False)
@@ -231,8 +248,10 @@ def explore(img):
         value='denominator',
         description='intensity:',
         style={'description_width': 'initial'},
+        layout=DROP_LAYOUT,
     )
-    hsi_button = W.Button(description='Plot HSI', button_style='primary')
+    hsi_button = W.Button(description='Plot HSI', button_style='primary',
+                          layout=BTN_LAYOUT)
 
     # Four output panels:
     # - status: drift correction messages, errors

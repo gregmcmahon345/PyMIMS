@@ -68,7 +68,7 @@ PERCENTILES = (1, 5, 10, 25, 50, 75, 90, 95, 99)
 # ── Core fitting routine ─────────────────────────────────────────────────────
 
 def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
-                    jitter=True, tail_weight_threshold=0.10):
+                    jitter=True, tail_weight_threshold=0.15):
     """
     Fit Gaussian mixtures with k = 1..k_max on log10(values).
 
@@ -90,16 +90,17 @@ def fit_channel_gmm(values, k_max=6, drop_zeros=True, random_state=0,
         artifacts that misspecify continuous GMM. Jitter softens these
         without biasing the distribution. Disable only if you have already
         non-integer or pre-binned data.
-    tail_weight_threshold : float, default 0.10
+    tail_weight_threshold : float, default 0.15
         Threshold for raising a tail-warning. If incrementing the sensible_k
         pick by 1 would introduce a new component whose mixing weight is
         below this fraction AND whose mean is higher than every component
         at the current sensible_k, a warning is raised. Catches cases where
-        rare high-count populations (e.g. Fe:S clusters in mitochondria,
+        rare high-count populations (Fe:S clusters in mitochondria,
         hot-spot enrichment, isolated organelles) would be suppressed by
-        the conservative default. Lower values catch rarer features at the
-        cost of more false alarms. 0.10 is a conservative default; 0.05 is
-        appropriate when you expect rare biological features.
+        the conservative default. The 0.15 default captures most biological
+        tail populations, which empirically tend to occupy 5–20% of pixels.
+        Lower to 0.05 if you only care about very rare features; raise to
+        0.20 if you're getting false alarms on plain bimodal channels.
 
     Returns
     -------
@@ -523,7 +524,7 @@ def _unique_k_recommendations(bic_k, sensible_k, largest_drop_k, kneedle_k):
 
 
 def _detect_tail_warning(components_by_k, sensible_k, k_max,
-                         weight_threshold=0.10):
+                         weight_threshold=0.15):
     """
     Check whether incrementing sensible_k would reveal a low-weight,
     high-mean component the conservative pick is suppressing.
@@ -561,9 +562,12 @@ def _detect_tail_warning(components_by_k, sensible_k, k_max,
 
     # Trigger condition: top component at k+1 has a higher mean AND a low
     # mixing weight. Both must hold; otherwise k+1 is just splitting an
-    # existing component rather than revealing a new tail.
+    # existing component rather than revealing a new tail. The weight
+    # comparison uses <= so that "set threshold to 0.15" includes
+    # populations exactly at 15% (the boundary case the user explicitly
+    # asked to be flagged).
     if (top_kp1['mean_counts'] > max_mean_at_k
-            and top_kp1['weight'] < weight_threshold):
+            and top_kp1['weight'] <= weight_threshold):
         q = top_kp1['quantiles']
         return {
             'suggested_k' : sensible_k + 1,
@@ -580,7 +584,7 @@ def _detect_tail_warning(components_by_k, sensible_k, k_max,
 
 def plot_histograms(img, channel=None, k_max=6, n_bins=80,
                     drop_zeros=True, corrected=True, jitter=True,
-                    tail_weight_threshold=0.10,
+                    tail_weight_threshold=0.15,
                     figsize_per_panel=(2.8, 2.4), outpath=None,
                     show=True, verbose=True):
     """

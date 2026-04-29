@@ -196,6 +196,8 @@ def explore(img):
                             button_style='warning')
     channels_button = W.Button(description='Show channels',
                                button_style='info')
+    log_scale_cb = W.Checkbox(value=False, description='log scale',
+                              indent=False)
 
     # ── Ratio controls ──────────────────────────────────────────────────────
     num_dd = W.Dropdown(options=channel_options, value=0,
@@ -214,12 +216,32 @@ def explore(img):
                           style={'description_width': 'initial'})
     plot_button = W.Button(description='Plot ratio', button_style='success')
 
-    # Three output panels:
+    # ── HSI controls ────────────────────────────────────────────────────────
+    hsi_cmap = W.Dropdown(
+        options=['viridis', 'plasma', 'inferno', 'magma', 'twilight',
+                 'rainbow', 'jet'],
+        value='viridis',
+        description='cmap:',
+        style={'description_width': 'initial'},
+    )
+    hsi_cmap_reverse = W.Checkbox(value=False, description='reverse',
+                                  indent=False)
+    hsi_intensity = W.Dropdown(
+        options=['denominator', 'numerator', 'sum'],
+        value='denominator',
+        description='intensity:',
+        style={'description_width': 'initial'},
+    )
+    hsi_button = W.Button(description='Plot HSI', button_style='primary')
+
+    # Four output panels:
     # - status: drift correction messages, errors
-    # - channels_out: the all-channels plot (pinned, only changes on demand)
-    # - ratio_out: the four-panel ratio figure (changes every Plot ratio)
+    # - channels_out: all-channels plot (pinned, only changes on demand)
+    # - hsi_out: HSI composite (pinned, only changes on demand)
+    # - ratio_out: four-panel ratio figure (changes every Plot ratio)
     status_out   = W.Output()
     channels_out = W.Output()
+    hsi_out      = W.Output()
     ratio_out    = W.Output()
 
     # ── Callbacks ───────────────────────────────────────────────────────────
@@ -239,7 +261,33 @@ def explore(img):
         with channels_out:
             clear_output(wait=True)
             try:
-                fig = img.plot(outpath=None, show=True)
+                fig = img.plot(outpath=None, show=True,
+                               log_scale=log_scale_cb.value)
+                display(fig)
+                import matplotlib.pyplot as plt
+                plt.close(fig)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+
+    def do_hsi(_):
+        with hsi_out:
+            clear_output(wait=True)
+            try:
+                num = num_dd.value
+                den = den_dd.value
+                num_lab = masses[num]; den_lab = masses[den]
+                print(f"HSI {num_lab}/{den_lab}  |  intensity: {hsi_intensity.value}  |  "
+                      f"cmap: {hsi_cmap.value}{'_r' if hsi_cmap_reverse.value else ''}")
+                fig, info = img.plot_hsi(
+                    num, den,
+                    intensity=hsi_intensity.value,
+                    cmap=hsi_cmap.value,
+                    cmap_reverse=hsi_cmap_reverse.value,
+                    min_counts=min_counts.value if min_counts.value > 0 else None,
+                    outpath=None,
+                    show=True,
+                )
                 display(fig)
                 import matplotlib.pyplot as plt
                 plt.close(fig)
@@ -291,18 +339,24 @@ def explore(img):
     drift_button.on_click(do_drift)
     channels_button.on_click(do_channels)
     plot_button.on_click(do_plot)
+    hsi_button.on_click(do_hsi)
 
     drift_box = W.VBox([
         W.HTML("<b>Drift correction</b>"),
         drift_ref, bin_planes, bin_apply,
-        W.HBox([drift_button, channels_button]),
+        W.HBox([drift_button, channels_button, log_scale_cb]),
     ])
     ratio_box = W.VBox([
         W.HTML("<b>Ratio</b>"),
         num_dd, den_dd, delta_text, min_counts, max_rel, plot_button,
     ])
+    hsi_box = W.VBox([
+        W.HTML("<b>HSI</b> <small>(uses Numerator / Denominator from Ratio panel)</small>"),
+        hsi_intensity, hsi_cmap, hsi_cmap_reverse, hsi_button,
+    ])
 
-    display(W.HBox([drift_box, ratio_box]))
+    display(W.HBox([drift_box, ratio_box, hsi_box]))
     display(status_out)
     display(channels_out)
+    display(hsi_out)
     display(ratio_out)

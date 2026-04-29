@@ -1,5 +1,5 @@
 """
-pymims.py  v0.3.1
+pymims.py  v0.4
 ===============================================================================
 DEVELOPMENT STATUS: Early prototype — not a public package.
 This library is an original work in development and is NOT available on PyPI
@@ -8,8 +8,8 @@ or any public repository. Do not distribute without the author's permission.
 
 Authors   : G. McMahon (principal scientist) with AI-assisted development
 Created   : March 2026
-Updated   : April 2026 (v0.3.1 — display refinements, σ/R cap, valid% fix)
-Status    : v0.3.1 prototype
+Updated   : April 2026 (v0.4 — HSI composite, log scale for channels)
+Status    : v0.4 prototype
 
 Description
 -----------
@@ -442,7 +442,7 @@ class MimsImage:
 
     def plot(self, plane=None, corrected=True, outpath=None,
              cmap='gray', scalebar_color='red', percentile=99.5,
-             show=None):
+             log_scale=False, show=None):
         """
         Plot all mass channels as a figure with colorbars and scale bar.
 
@@ -463,6 +463,10 @@ class MimsImage:
             Scale bar colour (default 'red').
         percentile : float
             Upper display percentile for contrast (default 99.5).
+        log_scale : bool
+            If True, use a symmetric-log normalisation that handles zero counts
+            naturally and emphasises low-intensity features. Colour bar shows
+            log-spaced ticks. Default False (linear scale).
         show      : bool or None
             If True, return the figure for inline display (notebook).
             If False, close after saving (script).
@@ -472,6 +476,8 @@ class MimsImage:
         -------
         matplotlib.figure.Figure
         """
+        from matplotlib.colors import SymLogNorm, Normalize
+
         # Auto-detect notebook context
         if show is None:
             show = _IS_NOTEBOOK
@@ -480,7 +486,8 @@ class MimsImage:
             base   = os.path.splitext(os.path.basename(self.path))[0]
             outdir = os.path.dirname(self.path) if self.path and os.path.dirname(self.path) and os.access(os.path.dirname(self.path), os.W_OK) else os.getcwd()
             suffix = f'_plane{plane+1}' if plane is not None else '_sum'
-            outpath = os.path.join(outdir, base + suffix + '.png')
+            scale_suffix = '_log' if log_scale else ''
+            outpath = os.path.join(outdir, base + suffix + scale_suffix + '.png')
         # Choose data source
         if corrected and self.corrected is not None:
             arr = self.corrected
@@ -513,8 +520,19 @@ class MimsImage:
         for i, ax in enumerate(axes):
             img  = display[i]
             p99  = np.percentile(img, percentile) if img.max() > 0 else 1
-            im   = ax.imshow(img, cmap=cmap, vmin=0, vmax=p99,
-                             extent=[0, field_um, field_um, 0])
+
+            if log_scale:
+                # SymLogNorm: linear near zero, log for large values.
+                # linthresh sets where the linear region ends; 1 is appropriate
+                # for count data (sub-1 values are rare/impossible).
+                norm = SymLogNorm(linthresh=1.0, linscale=1.0,
+                                  vmin=0, vmax=max(p99, 2))
+                im = ax.imshow(img, cmap=cmap, norm=norm,
+                               extent=[0, field_um, field_um, 0])
+            else:
+                im = ax.imshow(img, cmap=cmap, vmin=0, vmax=p99,
+                               extent=[0, field_um, field_um, 0])
+
             ax.set_title(self.masses[i], color='white', fontsize=11,
                          fontweight='bold', pad=4)
             ax.set_facecolor(bg)
@@ -522,12 +540,17 @@ class MimsImage:
 
             # Colorbar
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
-            cbar.set_label('Counts', color='white', fontsize=8)
+            cbar.set_label('Counts (log)' if log_scale else 'Counts',
+                           color='white', fontsize=8)
             cbar.ax.yaxis.set_tick_params(color='white', labelcolor='white',
                                           labelsize=7)
             cbar.outline.set_edgecolor('white')
-            cbar.locator = ticker.MaxNLocator(nbins=5, integer=True)
-            cbar.update_ticks()
+            if not log_scale:
+                # Linear: clean integer ticks
+                cbar.locator = ticker.MaxNLocator(nbins=5, integer=True)
+                cbar.update_ticks()
+            # For log scale, let matplotlib's SymLogNorm pick its own
+            # log-spaced ticks — they're correct out of the box.
 
             # Scale bar (bottom left, inset)
             margin  = field_um * 0.05
@@ -863,6 +886,210 @@ class MimsImage:
 
         _finalize_figure(fig, outpath, show)
         return fig, result
+
+    # ── HSI (Hue-Saturation-Intensity) composite ─────────────────────────────
+
+    def plot_hsi(self, numerator, denominator, corrected=True,
+                 intensity='denominator',
+                 cmap='viridis', cmap_reverse=False,
+                 ratio_min=None, ratio_max=None,
+                 intensity_percentile=(1, 99.5),
+                 min_counts=None,
+                 scalebar_color='white',
+                 outpath=None, show=None):
+        """
+        HSI (Hue-Saturation-Intensity) composite image.
+
+        Hue encodes the ratio numerator/denominator; intensity (brightness)
+        encodes counts in a chosen channel — typically the denominator,
+        which marks "where the sample actually is". This solves the problem
+        in plain ratio images that bright-but-noisy edge pixels look identical
+        to bright-and-meaningful sample pixels.
+
+        Parameters
+        ----------
+        numerator, denominator : str or int
+            Channel name or index.
+        corrected : bool
+            Use drift-corrected stack if available.
+        intensity : str
+            Source for the brightness channel:
+              'denominator' (default) — counts in the denominator channel
+              'numerator'             — counts in the numerator channel
+              'sum'                   — A + B
+        cmap : str
+            Colourmap for the hue (ratio) axis. Useful options:
+              'viridis'  — perceptually uniform, recommended scientific default
+              'plasma', 'inferno', 'magma' — perceptually uniform alternatives
+              'twilight' — isoluminant, suited to HSI where hue alone matters
+              'rainbow'  — alias for 'hsv', OpenMIMS-compatible classic
+              'hsv'      — same as 'rainbow', explicit name
+              'jet'      — old-school rainbow (not recommended scientifically)
+        cmap_reverse : bool
+            Reverse the colourmap (equivalent to using a `_r` suffix).
+        ratio_min, ratio_max : float or None
+            Hue scaling range. If None, uses (1st, 99th) percentile of the
+            ratio for valid pixels. Pixels outside this range are clipped.
+        intensity_percentile : (lo, hi)
+            Percentile clip for the intensity normalisation (default 1, 99.5).
+        min_counts : float or None
+            Mask pixels (set to black) where the denominator counts are
+            below this threshold.
+        scalebar_color : str
+            Scale bar colour (default white).
+        outpath, show : see plot()
+
+        Returns
+        -------
+        (fig, info)
+            fig  : matplotlib Figure
+            info : dict with ratio, intensity, mask, ratio_range, cmap_name
+        """
+        # Map our cmap aliases
+        cmap_alias = {'rainbow': 'hsv'}
+        cmap_name = cmap_alias.get(cmap, cmap)
+        if cmap_reverse and not cmap_name.endswith('_r'):
+            cmap_name = cmap_name + '_r'
+
+        # Auto outpath in script mode
+        if show is None:
+            show = _IS_NOTEBOOK
+        if outpath is None and not _IS_NOTEBOOK:
+            base    = os.path.splitext(os.path.basename(self.path))[0]
+            num_i   = self._resolve_channel(numerator)
+            den_i   = self._resolve_channel(denominator)
+            num_safe = self.masses[num_i].replace(' ', '').replace('/', '_')
+            den_safe = self.masses[den_i].replace(' ', '').replace('/', '_')
+            outpath = os.path.join(os.getcwd(),
+                                   f"{base}_hsi_{num_safe}_over_{den_safe}.png")
+
+        # Build the ratio (sum across planes, with masking)
+        result = self.ratio(numerator, denominator, corrected=corrected,
+                            min_counts=min_counts)
+        R       = result['ratio']     # may contain NaN
+        A       = result['A']
+        B       = result['B']
+        num_lab = result['num_label']
+        den_lab = result['den_label']
+
+        # Choose intensity source
+        if intensity == 'denominator':
+            I = B
+            intensity_label = den_lab
+        elif intensity == 'numerator':
+            I = A
+            intensity_label = num_lab
+        elif intensity == 'sum':
+            I = A + B
+            intensity_label = f'{num_lab} + {den_lab}'
+        else:
+            raise ValueError(f"intensity must be 'denominator', 'numerator', "
+                             f"or 'sum'; got {intensity!r}")
+
+        # Determine ratio range for hue mapping
+        finite = np.isfinite(R)
+        if not finite.any():
+            raise ValueError("No valid pixels — relax masking thresholds.")
+        if ratio_min is None:
+            ratio_min = float(np.percentile(R[finite], 1))
+        if ratio_max is None:
+            ratio_max = float(np.percentile(R[finite], 99))
+        if ratio_max <= ratio_min:
+            ratio_max = ratio_min + 1e-12
+
+        # Normalise ratio to [0, 1] for colourmap lookup
+        R_norm = np.clip((R - ratio_min) / (ratio_max - ratio_min), 0, 1)
+        # NaN pixels become 0 (will be black after intensity multiplication)
+        R_norm = np.where(np.isnan(R_norm), 0, R_norm)
+
+        # Apply colourmap — get RGB for each pixel
+        colormap = plt.get_cmap(cmap_name)
+        rgb = colormap(R_norm)[:, :, :3]  # drop alpha
+
+        # Normalise intensity
+        I_finite = I[np.isfinite(I) & (I > 0)]
+        if I_finite.size > 0:
+            i_lo, i_hi = np.percentile(I_finite,
+                                       [intensity_percentile[0],
+                                        intensity_percentile[1]])
+        else:
+            i_lo, i_hi = 0, 1
+        if i_hi <= i_lo:
+            i_hi = i_lo + 1
+        I_norm = np.clip((I - i_lo) / (i_hi - i_lo), 0, 1)
+
+        # Apply mask: pixels where ratio is invalid OR intensity-source is too low
+        mask = np.isfinite(R) & np.isfinite(I)
+        if min_counts is not None:
+            mask &= (B >= min_counts)
+        I_norm = np.where(mask, I_norm, 0)
+
+        # Multiply colour by intensity to get final RGB
+        hsi_rgb = rgb * I_norm[:, :, None]
+        hsi_rgb = np.clip(hsi_rgb, 0, 1)
+
+        # ── Build figure: HSI image + a colourbar showing the hue scale ─────
+        bg       = '#1a1a1a'
+        field_um = self.metadata['field_um']
+        sb_um    = self._nice_scalebar(field_um)
+
+        fig = plt.figure(figsize=(8, 7), facecolor=bg)
+        # Main image axis + a thin colourbar axis on the right
+        ax       = fig.add_axes([0.05, 0.08, 0.78, 0.84])
+        cbar_ax  = fig.add_axes([0.85, 0.08, 0.03, 0.84])
+
+        ax.imshow(hsi_rgb, extent=[0, field_um, field_um, 0],
+                  interpolation='nearest')
+        ax.set_facecolor(bg)
+        ax.axis('off')
+        ax.set_xlim(0, field_um)
+        ax.set_ylim(field_um, 0)
+
+        # Scale bar
+        margin = field_um * 0.05
+        bar_y  = field_um - margin
+        bar_x0 = margin
+        bar_x1 = margin + sb_um
+        tick_h = field_um * 0.02
+        ax.plot([bar_x0, bar_x1], [bar_y, bar_y], '-',
+                color=scalebar_color, linewidth=2.5, solid_capstyle='butt')
+        for xp in [bar_x0, bar_x1]:
+            ax.plot([xp, xp], [bar_y - tick_h, bar_y + tick_h],
+                    '-', color=scalebar_color, linewidth=2)
+        ax.text((bar_x0 + bar_x1) / 2, bar_y - tick_h * 2,
+                f'{sb_um:g} μm', color=scalebar_color,
+                fontsize=9, ha='center', va='bottom')
+
+        # Hue colourbar — shows the ratio scale only (no intensity component)
+        from matplotlib.colors import Normalize
+        from matplotlib.cm import ScalarMappable
+        sm = ScalarMappable(norm=Normalize(vmin=ratio_min, vmax=ratio_max),
+                            cmap=colormap)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, cax=cbar_ax)
+        cbar.set_label(f'Ratio  {num_lab}/{den_lab}',
+                       color='white', fontsize=10)
+        cbar.ax.yaxis.set_tick_params(color='white', labelcolor='white',
+                                      labelsize=8)
+        cbar.outline.set_edgecolor('white')
+
+        # Title
+        title = (f"{os.path.basename(self.path)}  |  "
+                 f"HSI {num_lab}/{den_lab}  |  "
+                 f"intensity: {intensity_label}  |  "
+                 f"cmap: {cmap}{'_r' if cmap_reverse else ''}  |  "
+                 f"hue range: {ratio_min:.4g}–{ratio_max:.4g}")
+        fig.suptitle(title, color='white', fontsize=10, y=0.98)
+
+        info = {
+            'ratio'      : R,
+            'intensity'  : I,
+            'mask'       : mask,
+            'ratio_range': (ratio_min, ratio_max),
+            'cmap_name'  : cmap_name,
+        }
+        _finalize_figure(fig, outpath, show)
+        return fig, info
 
     # ── Data access ──────────────────────────────────────────────────────────
 

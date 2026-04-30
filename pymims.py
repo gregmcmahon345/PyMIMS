@@ -545,6 +545,9 @@ class MimsImage:
         # Actually drop them
         keep_mask = ~suspect
         self.data = self.data[keep_mask]
+        # Keep metadata in sync — n_planes is consulted by drift_correct
+        # and other downstream operations
+        self.metadata['n_planes'] = int(self.data.shape[0])
         if self.corrected is not None:
             # Drift correction has already been applied; invalidate it
             # so the user knows to re-run drift_correct on the new stack
@@ -685,7 +688,14 @@ class MimsImage:
         """
         # Resolve reference channel index
         ref_ch = self._resolve_channel(reference)
-        n_planes = self.metadata['n_planes']
+        # Always read the plane count from the actual array, not from
+        # metadata — `auto_drop_bad_planes` might have shrunk the stack
+        # since the metadata was last set, and trusting the array is
+        # always correct.
+        n_planes = int(self.data.shape[0])
+        # Keep metadata in sync as a side effect, so subsequent reads of
+        # metadata['n_planes'] see the right value.
+        self.metadata['n_planes'] = n_planes
         n_masses = self.metadata['n_masses']
         w = self.metadata['width']
 

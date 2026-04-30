@@ -361,6 +361,289 @@ class MimsImage:
 
         self.data = raw.reshape(shape)
 
+    # ── Plane quality control ─────────────────────────────────────────────────
+
+    def _plane_totals(self, channel=None):
+        """
+        Sum of counts per plane. Used for bad-plane detection.
+
+        Parameters
+        ----------
+        channel : str, int, or None
+            If None (default), sum over ALL channels — most robust against
+            channel-specific artefacts. If a channel is named or indexed,
+            sum only that channel's counts per plane.
+
+        Returns
+        -------
+        1-D array of length n_planes; entry i is the total counts in plane i.
+        """
+        if self.data is None:
+            raise RuntimeError("Image data not loaded.")
+        if channel is None:
+            # Sum over all channels and pixels per plane
+            return self.data.astype(np.int64).sum(axis=(1, 2, 3))
+        ch_idx = self._resolve_channel(channel)
+        return self.data[:, ch_idx].astype(np.int64).sum(axis=(1, 2))
+
+    def plot_plane_diagnostics(self, channel=None, threshold_pct=30,
+                                outpath=None, dpi=200, show=True):
+        """
+        Plot total counts per plane and flag potentially-bad planes.
+
+        Bad planes (charging events, electronic glitches, partly-blank
+        frames) deviate sharply from the median total. Such planes are
+        the principal cause of silent drift-correction failures: an
+        electronically-noisy plane has no real cross-correlation peak,
+        so the FFT registers garbage shifts and the stack becomes
+        misaligned.
+
+        Parameters
+        ----------
+        channel : str, int, or None
+            What to sum per plane. None = all channels (default; most
+            robust). A named/indexed channel restricts to that channel —
+            useful when one detector has known issues.
+        threshold_pct : float, default 30
+            Percent deviation from the median total above which a plane
+            is flagged as suspect. 30% is reasonable for biological
+            samples; tighten to 15-20% for stable acquisitions, loosen to
+            50% if the sample naturally varies plane-to-plane.
+        outpath : str or None
+            File path for saved figure (PNG/PDF/SVG by extension).
+        dpi : int, default 200
+        show : bool, default True
+
+        Returns
+        -------
+        dict with keys:
+            'totals'     : array of per-plane totals (length n_planes)
+            'median'     : float, the reference value
+            'deviations' : array of |total - median| / median (length n_planes)
+            'suspect'    : 1-D bool array, True where deviation exceeds threshold
+            'suspect_indices' : list of plane indices flagged
+            'figure'     : the matplotlib Figure
+        """
+        totals = self._plane_totals(channel=channel)
+        n_planes = len(totals)
+        if n_planes < 2:
+            raise RuntimeError("Need at least 2 planes for plane diagnostics.")
+
+        median = float(np.median(totals))
+        deviations = np.abs(totals - median) / max(median, 1.0)
+        suspect = deviations > (threshold_pct / 100.0)
+        suspect_indices = np.where(suspect)[0].tolist()
+
+        fig, ax = plt.subplots(figsize=(11, 4), facecolor='white')
+        plane_idx = np.arange(n_planes)
+        # Plot all planes as a line
+        ax.plot(plane_idx, totals, '-', color='steelblue',
+                linewidth=1.0, alpha=0.7, label='per-plane total')
+        # Good planes: small filled markers
+        ax.plot(plane_idx[~suspect], totals[~suspect],
+                'o', color='steelblue', markersize=3, label='ok')
+        # Suspect planes: large red X
+        if suspect.any():
+            ax.plot(plane_idx[suspect], totals[suspect],
+                    'X', color='darkred', markersize=10,
+                    markeredgewidth=1.5, label=f'suspect ({suspect.sum()})')
+            # Annotate plane numbers
+            for idx in suspect_indices:
+                ax.annotate(f'{idx}', xy=(idx, totals[idx]),
+                            xytext=(0, 8), textcoords='offset points',
+                            fontsize=7, ha='center', color='darkred')
+
+        ax.axhline(median, color='gray', linewidth=0.8, linestyle='--',
+                   label=f'median ({median:.0f})')
+        ax.fill_between(plane_idx,
+                        median * (1 - threshold_pct / 100),
+                        median * (1 + threshold_pct / 100),
+                        color='gray', alpha=0.12,
+                        label=f'±{threshold_pct:.0f}%')
+        ax.set_xlabel('plane index')
+        ax.set_ylabel(f'total counts'
+                      + (f' ({self.masses[self._resolve_channel(channel)]})'
+                         if channel is not None else ' (all channels)'))
+        ch_label = (self.masses[self._resolve_channel(channel)]
+                    if channel is not None else 'all channels')
+        title = (f'Plane quality scan ({ch_label})  —  '
+                 f'{suspect.sum()} of {n_planes} planes flagged at '
+                 f'±{threshold_pct:.0f}% from median')
+        ax.set_title(title, fontsize=10)
+        ax.legend(fontsize=8, loc='best', frameon=False)
+        for spine in ('top', 'right'):
+            ax.spines[spine].set_visible(False)
+        fig.tight_layout()
+
+        if outpath:
+            fig.savefig(outpath, dpi=dpi, bbox_inches='tight',
+                        facecolor='white')
+            print(f'Saved: {outpath}')
+        if not show:
+            plt.close(fig)
+
+        return {
+            'totals': totals,
+            'median': median,
+            'deviations': deviations,
+            'suspect': suspect,
+            'suspect_indices': suspect_indices,
+            'figure': fig,
+        }
+
+    def auto_drop_bad_planes(self, threshold_pct=30, channel=None,
+                              dry_run=False, verbose=True):
+        """
+        Detect and (optionally) drop bad planes from the stack.
+
+        Bad planes (those deviating more than ``threshold_pct``% from the
+        median total counts) are removed in place. The original plane
+        indices are recorded in ``self._dropped_planes`` for the record;
+        ``self.data.shape[0]`` shrinks accordingly. The action is
+        destructive — re-load the file to recover.
+
+        Run BEFORE drift correction. Bad planes are the principal cause
+        of silent drift-correction failures.
+
+        Parameters
+        ----------
+        threshold_pct : float, default 30
+            Percent deviation from median total at which to drop.
+        channel : str, int, or None
+            Channel to use for the deviation test. None = sum over all
+            channels (default; most robust).
+        dry_run : bool, default False
+            If True, identify bad planes and print the list but DO NOT
+            modify the data. Useful for previewing what auto-drop would do.
+        verbose : bool, default True
+            Print the list of dropped plane indices.
+
+        Returns
+        -------
+        list of int — the (original) plane indices that were dropped.
+        """
+        totals = self._plane_totals(channel=channel)
+        median = float(np.median(totals))
+        deviations = np.abs(totals - median) / max(median, 1.0)
+        suspect = deviations > (threshold_pct / 100.0)
+        bad_indices = np.where(suspect)[0].tolist()
+
+        if not bad_indices:
+            if verbose:
+                print(f"No planes flagged at ±{threshold_pct:.0f}% threshold "
+                      f"({len(totals)} planes scanned).")
+            return []
+
+        if dry_run:
+            if verbose:
+                print(f"[DRY RUN] Would drop {len(bad_indices)} plane(s): "
+                      f"{bad_indices}")
+                print(f"  Stack would shrink from {len(totals)} to "
+                      f"{len(totals) - len(bad_indices)} planes.")
+            return bad_indices
+
+        # Actually drop them
+        keep_mask = ~suspect
+        self.data = self.data[keep_mask]
+        if self.corrected is not None:
+            # Drift correction has already been applied; invalidate it
+            # so the user knows to re-run drift_correct on the new stack
+            self.corrected = None
+            self.shifts = None
+            if verbose:
+                print("Note: dropping planes invalidated previous drift "
+                      "correction. Re-run img.drift_correct() afterwards.")
+
+        # Track what was dropped for provenance
+        if not hasattr(self, '_dropped_planes'):
+            self._dropped_planes = []
+        self._dropped_planes.extend(bad_indices)
+
+        if verbose:
+            print(f"Dropped {len(bad_indices)} plane(s) at ±{threshold_pct:.0f}% "
+                  f"threshold: {bad_indices}")
+            print(f"  Stack: {len(totals)} → {self.data.shape[0]} planes "
+                  f"(median total = {median:.0f}).")
+        return bad_indices
+
+    def plane_movie(self, channel=0, interval_ms=200, cmap='viridis',
+                     percentile_clip=(1, 99), figsize=(5, 5)):
+        """
+        Animation through every plane of a chosen channel. Useful for
+        catching electronic glitches, charging events, or partial blank
+        frames that the diagnostic plot might miss.
+
+        Returns an IPython HTML animation object that displays inline in
+        Jupyter / Colab. May be slow to encode on stacks of >100 planes
+        (~2-3 seconds per 100 planes); for very deep stacks consider
+        viewing a subset by slicing self.data first.
+
+        Parameters
+        ----------
+        channel : str or int, default 0
+            Channel to display.
+        interval_ms : int, default 200
+            Milliseconds per frame. 200 ms = 5 fps, comfortable for
+            visual inspection. 100 ms = 10 fps if you want to scroll fast.
+        cmap : str, default 'viridis'
+            Matplotlib colourmap.
+        percentile_clip : (lo, hi) tuple
+            Brightness range as count-distribution percentiles, evaluated
+            once across all planes for stable contrast as the movie plays.
+        figsize : (w, h) tuple
+            Figure size in inches.
+
+        Returns
+        -------
+        IPython.display.HTML object — render inline by returning it as
+        the last expression of a notebook cell.
+
+        Example
+        -------
+            mov = img.plane_movie(channel='12C 14N', interval_ms=150)
+            mov   # display in the cell output
+        """
+        from matplotlib.animation import FuncAnimation
+        from IPython.display import HTML
+        ch_idx = self._resolve_channel(channel)
+        n_planes = self.data.shape[0]
+        if n_planes < 2:
+            raise RuntimeError("Need at least 2 planes for an animation.")
+
+        # Stable contrast: compute clip range once over the whole stack
+        all_data = self.data[:, ch_idx]
+        finite = all_data[(all_data > 0) & np.isfinite(all_data)]
+        if finite.size:
+            vmin, vmax = np.percentile(finite, percentile_clip)
+        else:
+            vmin, vmax = 0, 1
+
+        field_um = self.metadata.get('field_um', None)
+        extent = ([0, field_um, field_um, 0]
+                   if field_um is not None else None)
+
+        fig, ax = plt.subplots(figsize=figsize, facecolor='white')
+        im = ax.imshow(all_data[0], cmap=cmap, vmin=vmin, vmax=vmax,
+                       extent=extent, interpolation='nearest')
+        title = ax.set_title(f'plane 0 / {n_planes - 1}   '
+                             f'channel: {self.masses[ch_idx]}',
+                             fontsize=10)
+        if field_um is not None:
+            ax.set_xlabel('μm'); ax.set_ylabel('μm')
+
+        def update(frame):
+            im.set_array(all_data[frame])
+            title.set_text(f'plane {frame} / {n_planes - 1}   '
+                            f'channel: {self.masses[ch_idx]}')
+            return [im, title]
+
+        anim = FuncAnimation(fig, update, frames=n_planes,
+                             interval=interval_ms, blit=False)
+        # Use jshtml for an interactive playback bar in Jupyter
+        html = HTML(anim.to_jshtml())
+        plt.close(fig)
+        return html
+
     # ── Drift correction ─────────────────────────────────────────────────────
 
     def drift_correct(self, reference='SE', ref_plane=0,

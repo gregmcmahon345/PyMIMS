@@ -69,6 +69,30 @@ from pymims_histograms import _elbow_largest_drop, _elbow_kneedle
 FEATURE_SPACES = ('log_zscored', 'log_robustz', 'log', 'raw', 'ratios')
 
 
+# ── SE / topography channel detection ────────────────────────────────────────
+
+def _is_se_channel(label):
+    """
+    Heuristic: does a channel label look like a secondary-electron /
+    topography channel rather than a chemical mass channel?
+
+    SE channels measure topography rather than chemistry, so they don't
+    belong in chemistry-driven clustering. Different acquisitions name
+    them differently — 'SE', 'Secondary Electron', 'e⁻', 'e-', 'EM',
+    sometimes just a number that turns out to be the SE detector.
+
+    This matches the common naming patterns. If your channel uses a
+    non-matching label, pass channels= explicitly.
+    """
+    if not isinstance(label, str):
+        return False
+    s = label.strip().lower()
+    se_patterns = ('se', 'secondary electron', 'e-', 'e⁻', 'em',
+                   'topography', 'topo')
+    # Match exact tokens, not substrings (so '15n' doesn't match 'em')
+    return s in se_patterns or s.startswith('se ') or s.startswith('secondary')
+
+
 # ── Feature-space construction ───────────────────────────────────────────────
 
 def _build_feature_array(img, channels, feature_space, ratio_pairs=None,
@@ -554,7 +578,8 @@ def _select_cluster_count(metrics):
 # ── Top-level entry point ────────────────────────────────────────────────────
 
 def cluster_pixels(img, method='kmeans', k_max=10,
-                   channels=None, feature_space='log_zscored',
+                   channels=None, include_se=False,
+                   feature_space='log_zscored',
                    ratio_pairs=None,
                    min_counts=None, mask_channel=None, pixel_filter=None,
                    subsample_size=5000, linkage_method='ward',
@@ -573,9 +598,18 @@ def cluster_pixels(img, method='kmeans', k_max=10,
     k_max : int, default 10
         Maximum cluster count to evaluate. The sweep runs k=2..k_max.
     channels : list[str or int] or None
-        Channels to include in the feature vector. None = all channels.
-        Pass an explicit list to exclude e.g. SE or other diagnostic
-        channels: channels=['12C 14N', '12C 15N', '31P', '32S'].
+        Channels to include in the feature vector. None (default) = all
+        chemical mass channels, with any SE-like topography channels
+        auto-excluded (see include_se). Pass an explicit list to override:
+        channels=['12C 14N', '12C 15N', '31P', '32S'].
+    include_se : bool, default False
+        If True, includes any SE-like topography channels in the
+        clustering features. Default behaviour excludes them because SE
+        measures topography rather than chemistry, and chemistry-driven
+        clustering should not be confounded by surface relief. Set True
+        only if you specifically want SE in the feature space (rare).
+        Has no effect if `channels` is given explicitly — the user list
+        is taken at face value.
     feature_space : str
         'log_zscored' (default) — log10 then z-score per channel; equalises
                                  channel contributions and is the standard
@@ -650,7 +684,22 @@ def cluster_pixels(img, method='kmeans', k_max=10,
 
     # Resolve channel list
     if channels is None and feature_space != 'ratios':
-        channels = list(range(len(img.masses)))
+        # Default: all channels EXCEPT SE-like topography channels.
+        # SE measures sample topography, not chemistry, so it doesn't
+        # belong in chemistry-driven clustering. Use include_se=True if
+        # you genuinely want to include it.
+        all_indices = list(range(len(img.masses)))
+        if include_se:
+            channels = all_indices
+        else:
+            channels = [i for i in all_indices
+                        if not _is_se_channel(img.masses[i])]
+            excluded = [img.masses[i] for i in all_indices
+                        if _is_se_channel(img.masses[i])]
+            if excluded:
+                print(f"Auto-excluded SE-like channel(s) from clustering: "
+                      f"{excluded}. Pass include_se=True to keep them, or "
+                      f"channels=[...] for explicit control.")
 
     # Build full feature matrix
     X_full, feature_labels, (H, W) = _build_feature_array(
@@ -797,6 +846,34 @@ def _centroids_to_counts(img, channels, feature_space, centroids_by_k):
 
 # ── Plotting ─────────────────────────────────────────────────────────────────
 
+def _cophenetic_interpretation(corr):
+    """
+    Short interpretive label for a cophenetic correlation value.
+
+    Returns (band_label, plain_english) — used on figure titles to
+    save the user from having to remember the thresholds. Bands follow
+    the standard cluster-analysis convention (Romesburg 1984).
+    """
+    if corr >= 0.90:
+        return ('strong',
+                'dendrogram faithfully represents the data')
+    elif corr >= 0.80:
+        return ('good',
+                'dendrogram represents the data well')
+    elif corr >= 0.70:
+        return ('moderate',
+                'some distortion; cluster cuts still usable')
+    else:
+        return ('weak',
+                'noticeable distortion; treat cluster cuts with caution')
+
+
+def _format_cophenetic_block(corr):
+    """Compact two-line block for figure titles. Bold-ish via newline."""
+    band, hint = _cophenetic_interpretation(corr)
+    return f'cophenetic corr = {corr:.3f}  ({band})\n{hint}'
+
+
 def plot_cluster_labels(img, result, k=None, cmap='tab10',
                         outpath=None, show=True):
     """
@@ -888,11 +965,34 @@ def plot_cluster_labels(img, result, k=None, cmap='tab10',
     ax_table.set_title('Cluster summary (centroid means, raw counts)',
                        fontsize=10, pad=8)
 
+    # If hierarchical, add a 2-line cophenetic-correlation footnote below
+    # the table. The table itself sits in the upper portion of ax_table;
+    # this places the footnote in the lower portion.
+    if result['method'] == 'hierarchical':
+        band, hint = _cophenetic_interpretation(result['cophenetic_corr'])
+        footnote = (
+            f"Cophenetic correlation = {result['cophenetic_corr']:.3f} ({band})\n"
+            f"   {hint}.\n"
+            f"   Measures how well the dendrogram preserves the original\n"
+            f"   pairwise distances between pixels. ≥ 0.9 = strong;\n"
+            f"   0.8–0.9 = good; 0.7–0.8 = moderate; < 0.7 = weak."
+        )
+        ax_table.text(
+            0.0, -0.05, footnote,
+            transform=ax_table.transAxes,
+            fontsize=8, ha='left', va='top',
+            family='monospace',
+            color='#444',
+        )
+
     # Top-level info
     info_bits = [f"feature space: {result['feature_space']}",
                  f"channels: {', '.join(feat_labels)}"]
     if result['method'] == 'hierarchical':
-        info_bits.append(f"cophenetic corr: {result['cophenetic_corr']:.3f}")
+        band, _ = _cophenetic_interpretation(result['cophenetic_corr'])
+        info_bits.append(
+            f"cophenetic corr: {result['cophenetic_corr']:.3f} ({band})"
+        )
     fig.suptitle('  |  '.join(info_bits), fontsize=9, y=1.0)
 
     fig.tight_layout()
@@ -965,7 +1065,9 @@ def plot_metric_sweep(result, outpath=None, show=True):
 
     title = f"Cluster-count selection  ({result['method']}"
     if result['method'] == 'hierarchical':
-        title += f", cophenetic corr={result['cophenetic_corr']:.3f}"
+        band, _ = _cophenetic_interpretation(result['cophenetic_corr'])
+        title += (f", cophenetic corr={result['cophenetic_corr']:.3f} "
+                  f"({band})")
     title += ')'
     fig.suptitle(title, fontsize=11, y=1.0)
     fig.tight_layout()
@@ -1016,8 +1118,9 @@ def plot_dendrogram(result, k_marks=None, outpath=None, show=True):
         ax.axhline(height, color='darkred', linewidth=1.0, linestyle='--',
                    alpha=0.7, label=f'k={k}')
 
-    ax.set_title(f"Dendrogram ({result['linkage_method']} linkage)  "
-                 f"cophenetic corr = {result['cophenetic_corr']:.3f}",
+    title_main = f"Dendrogram ({result['linkage_method']} linkage)"
+    coph_block = _format_cophenetic_block(result['cophenetic_corr'])
+    ax.set_title(f"{title_main}\n{coph_block}",
                  fontsize=11, pad=10)
     ax.set_xlabel('cluster ID (or count of merged leaves)', fontsize=9)
     ax.set_ylabel('linkage distance', fontsize=9)

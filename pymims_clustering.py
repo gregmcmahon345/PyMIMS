@@ -1004,6 +1004,417 @@ def plot_cluster_labels(img, result, k=None, cmap='tab10',
     return fig
 
 
+def _cluster_palette(n_clusters, cmap='tab10'):
+    """Build the same colour list used by plot_cluster_labels, so that
+    overlays/grid panels can match the legend."""
+    cmap_obj = plt.get_cmap(cmap)
+    n = max(n_clusters, 1)
+    return [cmap_obj(i / max(n - 1, 1)) for i in range(n)]
+
+
+def _cluster_contours(label_image, cluster_id):
+    """
+    Find sub-pixel contours of a single cluster within a 2-D label image.
+    Uses scikit-image's marching-squares algorithm; returns a list of
+    contour arrays, one per disconnected region.
+
+    NaN-valued pixels (the masked-out regions) are treated as 'outside'.
+    """
+    try:
+        from skimage import measure
+    except ImportError:
+        raise ImportError(
+            "scikit-image is required for cluster contour overlays. "
+            "Install with: pip install scikit-image "
+            "(add --break-system-packages on Crostini)."
+        )
+    # Build a binary mask: 1 where this cluster, 0 elsewhere (incl. NaN).
+    mask = (label_image == cluster_id).astype(float)
+    # find_contours traces level=0.5 between 0 and 1 → cluster boundary.
+    contours = measure.find_contours(mask, 0.5)
+    return contours
+
+
+def extract_cluster_masks(result, k=None):
+    """
+    Return a dict {cluster_id: 2-D bool mask} for a chosen k.
+
+    Cluster IDs are 1-indexed to match the rest of the module
+    (consistent with plot_cluster_labels and the cluster summary tables).
+
+    Use this for downstream analysis like depth profiling:
+        masks = extract_cluster_masks(result, k=3)
+        for cid, mask in masks.items():
+            # mask has shape (H, W); apply per-plane to get counts...
+            pass
+
+    Parameters
+    ----------
+    result : ClusterResult dict from cluster_pixels()
+    k : int or None
+        Cluster count to extract. None = result['sensible_k'].
+
+    Returns
+    -------
+    dict {int → 2-D bool array}, one entry per cluster.
+    """
+    if k is None:
+        k = result['sensible_k']
+    if k not in result['labels_by_k']:
+        raise ValueError(f"k={k} not in result; available: "
+                         f"{sorted(result['labels_by_k'])}")
+    labels = result['labels_by_k'][k]
+    unique = np.unique(labels[~np.isnan(labels)]).astype(int)
+    return {int(cid): (labels == cid) for cid in unique}
+
+
+def plot_cluster_grid(img, result, k_list=None, cmap='tab10',
+                      n_cols=None, panel_size=(4, 4),
+                      outpath=None, show=True):
+    """
+    Side-by-side cluster images at multiple k values, with per-panel
+    summary tables. Useful for comparing 'what does Calinski-Harabasz say
+    vs. silhouette vs. sensible_k?' in a single figure.
+
+    Parameters
+    ----------
+    img : MimsImage
+    result : ClusterResult dict from cluster_pixels()
+    k_list : list[int] or None
+        k values to display side by side. None = unique recommendations
+        from the metric sweep, ordered ascending.
+    cmap : str
+        Categorical colormap (must match plot_cluster_labels).
+    n_cols : int or None
+        Columns in the grid; None = ceil(sqrt(len(k_list))).
+    panel_size : (w, h) tuple
+        Inches per panel; total figure size scales with the grid.
+    outpath, show : as for other plot_* functions.
+    """
+    if k_list is None:
+        k_list = [rec['k'] for rec in result['unique_k_recommendations']]
+        if not k_list:
+            k_list = [result['sensible_k']]
+
+    # Validate
+    for k in k_list:
+        if k not in result['labels_by_k']:
+            raise ValueError(f"k={k} not in result; available: "
+                             f"{sorted(result['labels_by_k'])}")
+
+    n_panels = len(k_list)
+    if n_cols is None:
+        n_cols = int(np.ceil(np.sqrt(n_panels)))
+    n_rows = int(np.ceil(n_panels / n_cols))
+
+    field_um = img.metadata['field_um']
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(panel_size[0] * n_cols, panel_size[1] * n_rows),
+        squeeze=False, facecolor='white',
+    )
+
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    # Identify which k each method picked, for annotation
+    method_for_k = {}
+    for rec in result['unique_k_recommendations']:
+        method_for_k[rec['k']] = rec['methods']
+
+    for idx, k in enumerate(k_list):
+        row, col = divmod(idx, n_cols)
+        ax = axes[row][col]
+
+        labels = result['labels_by_k'][k]
+        n_clusters = k
+        colors = _cluster_palette(n_clusters, cmap=cmap)
+        discrete = ListedColormap(colors)
+        bounds = np.arange(0.5, n_clusters + 1.5)
+        norm = BoundaryNorm(bounds, discrete.N)
+        masked = np.ma.masked_invalid(labels)
+        discrete.set_bad(color='black')
+
+        ax.imshow(masked, extent=[0, field_um, field_um, 0],
+                  cmap=discrete, norm=norm, interpolation='nearest')
+
+        # Title: k + which method(s) picked it
+        methods = method_for_k.get(k, [])
+        if methods:
+            method_str = ', '.join(m.replace('_', ' ') for m in methods)
+            title = f'k = {k}\n({method_str})'
+        else:
+            title = f'k = {k}'
+        # Highlight sensible_k panel
+        is_sensible = (k == result['sensible_k'])
+        ax.set_title(title, fontsize=9,
+                     fontweight='bold' if is_sensible else 'normal',
+                     color='darkgreen' if is_sensible else 'black')
+        ax.set_xlabel('μm', fontsize=8)
+        ax.set_ylabel('μm', fontsize=8)
+        ax.tick_params(labelsize=7)
+
+        # Tiny inset legend showing cluster sizes (% only, for compactness)
+        sizes = result['cluster_sizes_by_k'][k]
+        total = sum(sizes)
+        for j in range(n_clusters):
+            pct = 100 * sizes[j] / total if total else 0
+            # Small coloured square + percentage at top-left corner inside the axis
+            ax.text(0.02, 0.97 - j * 0.06, f'■ {j+1}: {pct:.0f}%',
+                    transform=ax.transAxes,
+                    fontsize=7, color=colors[j],
+                    fontweight='bold',
+                    va='top', ha='left',
+                    bbox=dict(facecolor='white', edgecolor='none',
+                              alpha=0.7, pad=1))
+
+    # Hide unused panels
+    for idx in range(n_panels, n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        axes[row][col].axis('off')
+
+    title = (f"Cluster grid  ({result['method']}"
+             f", {len(result['feature_labels'])} channels)")
+    fig.suptitle(title, fontsize=11, y=1.0)
+    fig.tight_layout()
+
+    if outpath:
+        fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
+        print(f'Saved: {outpath}')
+    if not show:
+        plt.close(fig)
+    return fig
+
+
+def plot_overlay(img, result, k=None, base='channel',
+                 channel=None, numerator=None, denominator=None,
+                 cmap_base='viridis', cmap_clusters='tab10',
+                 base_kwargs=None, contour_linewidth=1.4,
+                 panel_size=(6, 6),
+                 outpath=None, show=True):
+    """
+    Overlay cluster outlines on top of a base image.
+
+    Cluster boundaries are drawn as sub-pixel contours using
+    scikit-image's marching-squares algorithm. Each cluster gets its
+    own colour, matching the cluster summary tables in
+    plot_cluster_labels. The base image is shown unmodified beneath.
+
+    Parameters
+    ----------
+    img : MimsImage
+    result : ClusterResult dict from cluster_pixels()
+    k : int or None
+        Cluster count to overlay. None = result['sensible_k'].
+    base : str
+        What underlies the overlay:
+        'channel' — single mass channel (requires `channel=`)
+        'ratio'   — ratio image (requires `numerator=`, `denominator=`)
+        'delta'   — δ value (requires numerator, denominator, plus
+                    a 'reference' value via base_kwargs)
+        'hsi'     — HSI composite (requires numerator, denominator)
+    channel : str, int, or None
+        For base='channel': which channel to display. Defaults to the
+        first non-SE mass channel.
+    numerator, denominator : str or int
+        For base='ratio'/'delta'/'hsi': the ratio components.
+    cmap_base : str
+        Colourmap for the base image (default viridis).
+    cmap_clusters : str
+        Categorical colourmap for cluster outlines (default tab10).
+    base_kwargs : dict or None
+        Extra kwargs passed through to the underlying renderer
+        (e.g. {'min_counts': 20, 'reference': 0.0037} for delta mode,
+        or {'scale_factor': 10000, 'ratio_min': 37} for HSI).
+    contour_linewidth : float
+        Cluster outline thickness in points.
+    panel_size : (w, h) tuple
+        Figure size in inches.
+    outpath, show : as for other plot_* functions.
+
+    Returns
+    -------
+    matplotlib Figure.
+    """
+    if k is None:
+        k = result['sensible_k']
+    if k not in result['labels_by_k']:
+        raise ValueError(f"k={k} not in result; available: "
+                         f"{sorted(result['labels_by_k'])}")
+
+    base_kwargs = base_kwargs or {}
+    labels = result['labels_by_k'][k]
+    field_um = img.metadata['field_um']
+
+    fig, ax = plt.subplots(figsize=panel_size, facecolor='white')
+
+    # ── Render the base image ────────────────────────────────────────────
+    if base == 'channel':
+        if channel is None:
+            # Default to the first non-SE channel
+            for i, m in enumerate(img.masses):
+                if not _is_se_channel(m):
+                    channel = i
+                    break
+            else:
+                channel = 0
+        ch_idx = img._resolve_channel(channel)
+        img_data = img.sum_stack(corrected=True)[ch_idx]
+        # Percentile-based contrast for the base
+        finite = img_data[np.isfinite(img_data) & (img_data > 0)]
+        if finite.size:
+            vmin, vmax = np.percentile(finite, [1, 99])
+        else:
+            vmin, vmax = 0, 1
+        ax.imshow(img_data, extent=[0, field_um, field_um, 0],
+                  cmap=cmap_base, vmin=vmin, vmax=vmax,
+                  interpolation='nearest')
+        base_label = f"{img.masses[ch_idx]} (counts)"
+
+    elif base == 'ratio':
+        if numerator is None or denominator is None:
+            raise ValueError("base='ratio' requires numerator= and denominator=")
+        result_ratio = img.ratio(numerator, denominator,
+                                  min_counts=base_kwargs.get('min_counts'))
+        R = result_ratio['ratio']
+        finite = R[np.isfinite(R)]
+        if finite.size:
+            vmin, vmax = np.percentile(finite, [1, 99])
+        else:
+            vmin, vmax = 0, 1
+        ax.imshow(R, extent=[0, field_um, field_um, 0],
+                  cmap=cmap_base, vmin=vmin, vmax=vmax,
+                  interpolation='nearest')
+        base_label = (f"Ratio {result_ratio['num_label']}/"
+                      f"{result_ratio['den_label']}")
+
+    elif base == 'delta':
+        if numerator is None or denominator is None:
+            raise ValueError("base='delta' requires numerator= and denominator=")
+        ref = base_kwargs.get('reference')
+        if ref is None:
+            raise ValueError("base='delta' requires a 'reference' entry "
+                             "in base_kwargs (the natural-abundance ratio)")
+        result_ratio = img.ratio(numerator, denominator,
+                                  min_counts=base_kwargs.get('min_counts'))
+        R = result_ratio['ratio']
+        delta = 1000.0 * (R / ref - 1.0)
+        delta_max = base_kwargs.get('delta_max', 10000)
+        ax.imshow(delta, extent=[0, field_um, field_um, 0],
+                  cmap='RdBu_r', vmin=-delta_max, vmax=delta_max,
+                  interpolation='nearest')
+        base_label = (f"δ {result_ratio['num_label']}/"
+                      f"{result_ratio['den_label']} (‰)")
+
+    elif base == 'hsi':
+        if numerator is None or denominator is None:
+            raise ValueError("base='hsi' requires numerator= and denominator=")
+        # Render HSI into a temporary axis using the existing renderer,
+        # then steal the resulting RGB array to put on our own axis.
+        # Simpler: just call plot_hsi() and put its output as a sub-image,
+        # but plot_hsi creates its own figure. Instead, replicate enough
+        # of the HSI logic here to render onto our axis directly.
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+        result_ratio = img.ratio(numerator, denominator,
+                                  min_counts=base_kwargs.get('min_counts'))
+        R = result_ratio['ratio']
+        B = result_ratio['B']
+        scale_factor = base_kwargs.get('scale_factor', 1.0)
+        ratio_min = base_kwargs.get('ratio_min')
+        ratio_max = base_kwargs.get('ratio_max')
+        finite = np.isfinite(R)
+        if ratio_min is None:
+            ratio_min_raw = float(np.percentile(R[finite], 1))
+        else:
+            ratio_min_raw = float(ratio_min) / scale_factor
+        if ratio_max is None:
+            ratio_max_raw = float(np.percentile(R[finite], 99))
+        else:
+            ratio_max_raw = float(ratio_max) / scale_factor
+        if ratio_max_raw <= ratio_min_raw:
+            ratio_max_raw = ratio_min_raw + 1e-12
+        R_norm = np.clip((R - ratio_min_raw) / (ratio_max_raw - ratio_min_raw),
+                         0, 1)
+        R_norm = np.where(np.isnan(R_norm), 0, R_norm)
+        cmap_obj = plt.get_cmap(cmap_base)
+        rgb = cmap_obj(R_norm)[:, :, :3]
+        # Intensity = denominator counts, percentile clipped
+        I = B
+        I_finite = I[np.isfinite(I) & (I > 0)]
+        if I_finite.size:
+            i_lo, i_hi = np.percentile(I_finite, [1, 99.5])
+        else:
+            i_lo, i_hi = 0, 1
+        if i_hi <= i_lo:
+            i_hi = i_lo + 1
+        I_norm = np.clip((I - i_lo) / (i_hi - i_lo), 0, 1)
+        mask = np.isfinite(R) & np.isfinite(I)
+        if base_kwargs.get('min_counts') is not None:
+            mask &= (B >= base_kwargs['min_counts'])
+        I_norm = np.where(mask, I_norm, 0)
+        hsi_rgb = np.clip(rgb * I_norm[:, :, None], 0, 1)
+        ax.imshow(hsi_rgb, extent=[0, field_um, field_um, 0],
+                  interpolation='nearest')
+        ax.set_facecolor('#1a1a1a')
+        base_label = (f"HSI {result_ratio['num_label']}/"
+                      f"{result_ratio['den_label']}")
+
+    else:
+        raise ValueError(f"base must be 'channel', 'ratio', 'delta', or "
+                         f"'hsi'; got {base!r}")
+
+    # ── Overlay the cluster contours ─────────────────────────────────────
+    n_clusters = k
+    colors = _cluster_palette(n_clusters, cmap=cmap_clusters)
+    H, W = labels.shape
+    # Pixel-to-axes coordinate transform: axis is [0, field_um] in both
+    # axes; pixels are rows (y) and columns (x). Note y-axis is inverted
+    # (origin at top-left).
+    px_per_um_x = W / field_um
+    px_per_um_y = H / field_um
+
+    legend_lines = []
+    for cid in range(1, n_clusters + 1):
+        contours = _cluster_contours(labels, cid)
+        if not contours:
+            continue
+        col = colors[cid - 1]
+        for ctr in contours:
+            # ctr has shape (n_points, 2) with (row, col) = (y_px, x_px)
+            ys = ctr[:, 0] / px_per_um_y
+            xs = ctr[:, 1] / px_per_um_x
+            ax.plot(xs, ys, color=col, linewidth=contour_linewidth, alpha=0.95)
+        legend_lines.append((cid, col))
+
+    # ── Cluster legend — small inset matching the cluster table ──────────
+    sizes = result['cluster_sizes_by_k'][k]
+    total = sum(sizes)
+    for cid, col in legend_lines:
+        pct = 100 * sizes[cid - 1] / total if total else 0
+        ax.text(0.02, 0.97 - (cid - 1) * 0.05,
+                f'━━ cluster {cid}  ({pct:.0f}%)',
+                transform=ax.transAxes,
+                fontsize=8, color=col,
+                fontweight='bold',
+                va='top', ha='left',
+                bbox=dict(facecolor='white', edgecolor='none',
+                          alpha=0.85, pad=2))
+
+    ax.set_title(f"{base_label}  +  cluster outlines (k={k})",
+                 fontsize=11, fontweight='bold', pad=8)
+    ax.set_xlabel('μm')
+    ax.set_ylabel('μm')
+
+    fig.tight_layout()
+    if outpath:
+        fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
+        print(f'Saved: {outpath}')
+    if not show:
+        plt.close(fig)
+    return fig
+
+
 def plot_metric_sweep(result, outpath=None, show=True):
     """
     Plot the five cluster-count selection metrics on a 2×3 grid:

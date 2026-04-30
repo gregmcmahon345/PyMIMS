@@ -1436,11 +1436,17 @@ def plot_overlay(img, result, k=None, base='channel',
     n_clusters = k
     colors = _cluster_palette(n_clusters, cmap=cmap_clusters)
     H, W = labels.shape
-    # Pixel-to-axes coordinate transform: axis is [0, field_um] in both
-    # axes; pixels are rows (y) and columns (x). Note y-axis is inverted
-    # (origin at top-left).
-    px_per_um_x = W / field_um
-    px_per_um_y = H / field_um
+    # Pixel-to-axes coordinate transform.
+    #
+    # imshow with extent=[0, field_um, field_um, 0] places the *outer edge*
+    # of the image at 0..field_um, so the centre of pixel (0, 0) sits at
+    # (0.5 * um_per_px, 0.5 * um_per_px). skimage.measure.find_contours
+    # returns coordinates where integer (i, j) is the pixel CENTRE, so we
+    # need to shift by half a pixel when converting to µm to align with
+    # imshow's coordinate frame. Without this shift, contours appear
+    # offset by half a pixel toward the upper-left.
+    um_per_px_y = field_um / H
+    um_per_px_x = field_um / W
 
     legend_lines = []
     for cid in range(1, n_clusters + 1):
@@ -1450,8 +1456,10 @@ def plot_overlay(img, result, k=None, base='channel',
         col = colors[cid - 1]
         for ctr in contours:
             # ctr has shape (n_points, 2) with (row, col) = (y_px, x_px)
-            ys = ctr[:, 0] / px_per_um_y
-            xs = ctr[:, 1] / px_per_um_x
+            # +0.5 puts the contour at the pixel-edge midpoint that aligns
+            # with imshow's extent placement.
+            ys = (ctr[:, 0] + 0.5) * um_per_px_y
+            xs = (ctr[:, 1] + 0.5) * um_per_px_x
             ax.plot(xs, ys, color=col, linewidth=contour_linewidth, alpha=0.95)
         legend_lines.append((cid, col))
 

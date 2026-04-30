@@ -340,7 +340,12 @@ def plot_rule_masks(img, rois, base='channel', channel=None,
     rule_palette = ['#e41a1c', '#377eb8', '#4daf4a', '#ff7f00',
                     '#984ea3', '#a65628']
     H, W = img.metadata['height'], img.metadata['width']
-    px_per_um = W / field_um
+    # Half-pixel offset to align find_contours' pixel-centre coordinates
+    # with imshow's extent (which places pixel edges at 0..field_um, so
+    # pixel centres sit at +0.5*um_per_px). See pymims_clustering.plot_overlay
+    # for the full discussion.
+    um_per_px_x = field_um / W
+    um_per_px_y = field_um / H
 
     rule_keys = [k for k in rois.keys() if k != 'combined']
 
@@ -350,8 +355,8 @@ def plot_rule_masks(img, rois, base='channel', channel=None,
             colour = rule_palette[i % len(rule_palette)]
             contours = measure.find_contours(mask.astype(float), 0.5)
             for ctr in contours:
-                ys = ctr[:, 0] / (H / field_um)
-                xs = ctr[:, 1] / px_per_um
+                ys = (ctr[:, 0] + 0.5) * um_per_px_y
+                xs = (ctr[:, 1] + 0.5) * um_per_px_x
                 ax.plot(xs, ys, color=colour, linewidth=contour_linewidth,
                         alpha=0.85, label=None)
             # Inline legend entry
@@ -365,8 +370,8 @@ def plot_rule_masks(img, rois, base='channel', channel=None,
     combined = rois['combined']
     contours = measure.find_contours(combined.astype(float), 0.5)
     for ctr in contours:
-        ys = ctr[:, 0] / (H / field_um)
-        xs = ctr[:, 1] / px_per_um
+        ys = (ctr[:, 0] + 0.5) * um_per_px_y
+        xs = (ctr[:, 1] + 0.5) * um_per_px_x
         ax.plot(xs, ys, color='white', linewidth=contour_linewidth + 0.6,
                 alpha=0.95)
     n_individual = len(rule_keys)

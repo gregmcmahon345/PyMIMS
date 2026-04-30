@@ -875,7 +875,7 @@ def _format_cophenetic_block(corr):
 
 
 def plot_cluster_labels(img, result, k=None, cmap=None,
-                        outpath=None, show=True):
+                        outpath=None, dpi=200, show=True):
     """
     Display the labelled cluster image at a chosen k.
 
@@ -995,7 +995,7 @@ def plot_cluster_labels(img, result, k=None, cmap=None,
 
     fig.tight_layout()
     if outpath:
-        fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
+        fig.savefig(outpath, dpi=dpi, bbox_inches='tight', facecolor='white')
         print(f'Saved: {outpath}')
     if not show:
         plt.close(fig)
@@ -1132,7 +1132,7 @@ def extract_cluster_masks(result, k=None):
 
 def plot_cluster_grid(img, result, k_list=None, cmap=None,
                       n_cols=None, panel_size=(4, 4),
-                      outpath=None, show=True):
+                      outpath=None, dpi=200, show=True):
     """
     Side-by-side cluster images at multiple k values, with per-panel
     summary tables. Useful for comparing 'what does Calinski-Harabasz say
@@ -1241,7 +1241,7 @@ def plot_cluster_grid(img, result, k_list=None, cmap=None,
     fig.tight_layout()
 
     if outpath:
-        fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
+        fig.savefig(outpath, dpi=dpi, bbox_inches='tight', facecolor='white')
         print(f'Saved: {outpath}')
     if not show:
         plt.close(fig)
@@ -1254,7 +1254,7 @@ def plot_overlay(img, result, k=None, base='channel',
                  base_kwargs=None, contour_linewidth=1.4,
                  min_pixels=1,
                  panel_size=(6, 6),
-                 outpath=None, show=True):
+                 outpath=None, dpi=200, show=True):
     """
     Overlay cluster outlines on top of a base image.
 
@@ -1484,14 +1484,14 @@ def plot_overlay(img, result, k=None, base='channel',
 
     fig.tight_layout()
     if outpath:
-        fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
+        fig.savefig(outpath, dpi=dpi, bbox_inches='tight', facecolor='white')
         print(f'Saved: {outpath}')
     if not show:
         plt.close(fig)
     return fig
 
 
-def plot_metric_sweep(result, outpath=None, show=True):
+def plot_metric_sweep(result, outpath=None, dpi=200, show=True):
     """
     Plot the five cluster-count selection metrics on a 2×3 grid:
     inertia, silhouette, Calinski-Harabasz, Davies-Bouldin, and Cubic CCC.
@@ -1560,14 +1560,14 @@ def plot_metric_sweep(result, outpath=None, show=True):
     fig.tight_layout()
 
     if outpath:
-        fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
+        fig.savefig(outpath, dpi=dpi, bbox_inches='tight', facecolor='white')
         print(f'Saved: {outpath}')
     if not show:
         plt.close(fig)
     return fig
 
 
-def plot_dendrogram(result, k_marks=None, outpath=None, show=True):
+def plot_dendrogram(result, k_marks=None, outpath=None, dpi=200, show=True):
     """
     Dendrogram for hierarchical results, with optional horizontal cut
     lines at chosen k values.
@@ -1618,7 +1618,7 @@ def plot_dendrogram(result, k_marks=None, outpath=None, show=True):
     fig.tight_layout()
 
     if outpath:
-        fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
+        fig.savefig(outpath, dpi=dpi, bbox_inches='tight', facecolor='white')
         print(f'Saved: {outpath}')
     if not show:
         plt.close(fig)

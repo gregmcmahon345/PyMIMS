@@ -149,6 +149,78 @@ def _finalize_figure(fig, outpath, show):
     return fig
 
 
+def save_figure(fig, path, dpi=600, format=None,
+                bbox_inches='tight', transparent=False,
+                facecolor=None):
+    """
+    Save a matplotlib Figure to disk at user-specified DPI and format.
+
+    Useful for re-saving any plot at publication quality after the fact:
+    render once for inspection at default DPI, then call save_figure(
+    fig, 'figure.pdf', dpi=600) to write a high-quality version.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        Figure to save. Returned by any of the plot_* functions when you
+        pass show=True (the default).
+    path : str
+        Output filename. Extension determines format unless `format` is
+        explicitly given. Common extensions: .png, .pdf, .svg, .tif.
+    dpi : int, default 600
+        Resolution in dots per inch. Only meaningful for raster formats
+        (PNG, TIF). Vector formats (PDF, SVG) ignore DPI — they are
+        resolution-independent. The default of 600 is publication-quality
+        for journals; 300 is web/screen quality.
+    format : str or None
+        Explicit format ('png', 'pdf', 'svg', 'tif', 'eps', 'jpg').
+        If None, inferred from `path` extension. Vector formats:
+        'pdf', 'svg', 'eps'. Raster formats: 'png', 'tif', 'jpg'.
+    bbox_inches : str or matplotlib.transforms.Bbox
+        How to crop the figure when saving. 'tight' (default) crops to
+        figure contents; None saves the full figure area including margins.
+    transparent : bool
+        If True, the figure background is transparent in the saved file.
+        Useful for layering figures in slideshows or vector editors.
+    facecolor : str or None
+        Override the figure's face colour at save time. None = use the
+        figure's current facecolor.
+
+    Returns
+    -------
+    str — the path the file was written to.
+
+    Examples
+    --------
+        # Render a clustering image
+        from pymims_clustering import plot_overlay
+        fig = plot_overlay(img, result, k=3, base='hsi',
+                           numerator='12C 15N', denominator='12C 14N')
+
+        # Save at 600 DPI for journal submission
+        save_figure(fig, 'figure_2a.png', dpi=600)
+
+        # Or save as vector PDF (DPI doesn't matter)
+        save_figure(fig, 'figure_2a.pdf')
+
+        # Multiple formats
+        for ext in ('png', 'pdf', 'svg'):
+            save_figure(fig, f'figure_2a.{ext}', dpi=600)
+    """
+    if facecolor is None:
+        facecolor = fig.get_facecolor()
+    fig.savefig(
+        path,
+        dpi=dpi,
+        format=format,
+        bbox_inches=bbox_inches,
+        transparent=transparent,
+        facecolor=facecolor,
+    )
+    print(f"Saved: {path}  ({dpi} DPI)")
+    return path
+
+
 # ── MimsImage class ──────────────────────────────────────────────────────────
 
 class MimsImage:

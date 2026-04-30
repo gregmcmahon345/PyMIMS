@@ -32,6 +32,7 @@ Example:
 """
 
 import re
+import numpy as np
 
 # Common natural-abundance isotope ratios (IUPAC/community standards).
 # Keys are written 'numerator/denominator'.
@@ -367,6 +368,306 @@ def cluster_overlay_slider(img, result):
         min_pix_slider,
     ])
     display(W.VBox([controls, out]))
+
+
+def roi_rule_slider(img, hist_results=None):
+    """
+    Interactive two-rule ROI builder with sliders.
+
+    Lets you build a rule-based ROI mask from up to two threshold rules,
+    combine them with AND/OR, filter out small connected components via
+    min_pixels, and visualise the result over a base image (channel,
+    ratio, delta, or HSI). All controls update live.
+
+    The widget is a thin wrapper around `pymims_rules.build_roi_masks`
+    + `pymims_rules.plot_rule_masks`. Anything you can do in the widget
+    you can also do in code; the widget exists to remove typing friction
+    for the routine case of "tune the cutoff and see what happens".
+
+    Parameters
+    ----------
+    img : MimsImage
+        Drift-corrected image.
+    hist_results : dict or None
+        Output of pymims_histograms.plot_histograms(). Required only if
+        you want to use 'gmm-component' mode for any rule. If None, the
+        gmm-component mode option is hidden from the dropdowns.
+
+    Usage
+    -----
+        from pymims_histograms import plot_histograms
+        from pymims_explore import roi_rule_slider
+
+        # Optional: pre-fit GMMs if you want gmm-component rules
+        hists = plot_histograms(img, k_max=6, show=False, verbose=False)
+        roi_rule_slider(img, hist_results=hists)
+
+        # Or, with no GMM support:
+        roi_rule_slider(img)
+
+    Notes
+    -----
+    Sliders use continuous_update=False so the figure only redraws on
+    release, not while dragging — keeps interaction responsive on a
+    256×256 image (~0.5 s per redraw).
+    """
+    try:
+        import ipywidgets as W
+        from IPython.display import display, clear_output
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(f"Widget UI requires ipywidgets: {e}")
+
+    from pymims_rules import build_roi_masks, plot_rule_masks
+
+    has_gmm = hist_results is not None
+    mode_options = ['counts', 'percentile']
+    if has_gmm:
+        mode_options.append('gmm-component')
+
+    # ── Rule controls factory ─────────────────────────────────────────────
+    # Each rule has: enable checkbox, channel, mode, cutoff (or k+component
+    # for gmm-component mode), and a comparison toggle. The cutoff control
+    # type changes with the mode, so we pre-build all variants and toggle
+    # visibility.
+    def make_rule_controls(rule_index, default_enabled):
+        enable = W.Checkbox(
+            value=default_enabled,
+            description=f'Rule {rule_index + 1}',
+            indent=False,
+            layout=W.Layout(width='130px'),
+        )
+        channel = W.Dropdown(
+            options=img.masses, value=img.masses[0],
+            description='channel:',
+            style={'description_width': 'initial'},
+            layout=W.Layout(width='200px'),
+        )
+        mode = W.Dropdown(
+            options=mode_options, value='percentile',
+            description='mode:',
+            style={'description_width': 'initial'},
+            layout=W.Layout(width='200px'),
+        )
+        comparison = W.Dropdown(
+            options=['>=', '>', '<=', '<'], value='>=',
+            description='cmp:',
+            style={'description_width': 'initial'},
+            layout=W.Layout(width='130px'),
+        )
+        # Cutoff variants — only one is visible at a time
+        counts_cutoff = W.FloatText(
+            value=100.0, description='counts:',
+            style={'description_width': 'initial'},
+            layout=W.Layout(width='180px'),
+        )
+        percentile_cutoff = W.FloatSlider(
+            value=90.0, min=0.0, max=100.0, step=0.5,
+            description='percentile:',
+            style={'description_width': 'initial'},
+            continuous_update=False,
+            layout=W.Layout(width='350px'),
+        )
+        # GMM controls
+        gmm_k = W.IntSlider(
+            value=3, min=2, max=6,
+            description='k:',
+            style={'description_width': 'initial'},
+            continuous_update=False,
+            layout=W.Layout(width='200px'),
+        )
+        gmm_component = W.Dropdown(
+            options=['highest', 'lowest', 0, 1, 2, 3, 4, 5],
+            value='highest',
+            description='component:',
+            style={'description_width': 'initial'},
+            layout=W.Layout(width='180px'),
+        )
+
+        def _toggle_visibility(*_):
+            """Show only the controls relevant to the current mode."""
+            m = mode.value
+            counts_cutoff.layout.display = 'flex' if m == 'counts' else 'none'
+            percentile_cutoff.layout.display = (
+                'flex' if m == 'percentile' else 'none'
+            )
+            gmm_k.layout.display = 'flex' if m == 'gmm-component' else 'none'
+            gmm_component.layout.display = (
+                'flex' if m == 'gmm-component' else 'none'
+            )
+        mode.observe(_toggle_visibility, names='value')
+        _toggle_visibility()   # set initial state
+
+        return {
+            'enable': enable,
+            'channel': channel,
+            'mode': mode,
+            'comparison': comparison,
+            'counts_cutoff': counts_cutoff,
+            'percentile_cutoff': percentile_cutoff,
+            'gmm_k': gmm_k,
+            'gmm_component': gmm_component,
+        }
+
+    rule1 = make_rule_controls(0, default_enabled=True)
+    rule2 = make_rule_controls(1, default_enabled=False)
+
+    # ── Combine + min_pixels ─────────────────────────────────────────────
+    combine_dd = W.Dropdown(
+        options=['AND', 'OR'], value='AND',
+        description='combine:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='150px'),
+    )
+    min_pix_slider = W.IntSlider(
+        value=1, min=1, max=200, step=1,
+        description='min pixels:',
+        style={'description_width': 'initial'},
+        continuous_update=False,
+        layout=W.Layout(width='400px'),
+    )
+
+    # ── Base-image controls (same as cluster_overlay_slider) ─────────────
+    base_dd = W.Dropdown(
+        options=['channel', 'ratio'], value='channel',
+        description='base:',
+        layout=W.Layout(width='180px'),
+    )
+    base_channel_dd = W.Dropdown(
+        options=img.masses, value=img.masses[0],
+        description='base channel:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='220px'),
+    )
+    base_num_dd = W.Dropdown(
+        options=img.masses, value=img.masses[0],
+        description='ratio num:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='200px'),
+    )
+    base_den_dd = W.Dropdown(
+        options=img.masses, value=img.masses[-1],
+        description='ratio den:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='200px'),
+    )
+
+    out = W.Output()
+
+    def _build_rule_dict(rule_ctrls, rule_index):
+        """Translate widget state into a rule dict for build_roi_masks."""
+        if not rule_ctrls['enable'].value:
+            return None
+        m = rule_ctrls['mode'].value
+        rule = {
+            'channel': rule_ctrls['channel'].value,
+            'mode': m,
+            'comparison': rule_ctrls['comparison'].value,
+            'name': f"rule_{rule_index + 1}",
+        }
+        if m == 'counts':
+            rule['cutoff'] = rule_ctrls['counts_cutoff'].value
+            rule['name'] = (f"{rule_ctrls['channel'].value} "
+                            f"{rule_ctrls['comparison'].value} "
+                            f"{rule_ctrls['counts_cutoff'].value:.0f}")
+        elif m == 'percentile':
+            rule['cutoff'] = rule_ctrls['percentile_cutoff'].value
+            rule['name'] = (f"{rule_ctrls['channel'].value} "
+                            f"p{rule_ctrls['percentile_cutoff'].value:.1f}"
+                            f" {rule_ctrls['comparison'].value}")
+        elif m == 'gmm-component':
+            rule['k'] = rule_ctrls['gmm_k'].value
+            rule['component'] = rule_ctrls['gmm_component'].value
+            rule['name'] = (f"{rule_ctrls['channel'].value} "
+                            f"GMM k={rule_ctrls['gmm_k'].value} "
+                            f"comp={rule_ctrls['gmm_component'].value}")
+        return rule
+
+    def render(*_):
+        with out:
+            clear_output(wait=True)
+            r1 = _build_rule_dict(rule1, 0)
+            r2 = _build_rule_dict(rule2, 1)
+            rules = [r for r in (r1, r2) if r is not None]
+            if not rules:
+                print("Enable at least one rule to see the ROI mask.")
+                return
+            try:
+                rois = build_roi_masks(
+                    img, rules=rules,
+                    combine=combine_dd.value,
+                    histograms=hist_results,
+                )
+                # Apply min_pixels via connected-component filter
+                if min_pix_slider.value > 1:
+                    try:
+                        from skimage import measure
+                        for k_name, mask in list(rois.items()):
+                            cc = measure.label(mask, connectivity=2)
+                            if cc.max() == 0:
+                                continue
+                            sizes = np.bincount(cc.ravel())
+                            keep = sizes >= min_pix_slider.value
+                            keep[0] = False
+                            rois[k_name] = keep[cc]
+                    except ImportError:
+                        pass
+
+                # Render the overlay
+                kwargs = dict(img=img, rois=rois,
+                              base=base_dd.value, show=False)
+                if base_dd.value == 'channel':
+                    kwargs['channel'] = base_channel_dd.value
+                else:
+                    kwargs['numerator']   = base_num_dd.value
+                    kwargs['denominator'] = base_den_dd.value
+                fig = plot_rule_masks(**kwargs)
+                display(fig)
+                plt.close(fig)
+
+                # Print summary
+                total_pixels = rois['combined'].size
+                combined_pixels = int(rois['combined'].sum())
+                print(f"\n  Combined ROI: {combined_pixels:,} pixels "
+                      f"({100 * combined_pixels / total_pixels:.1f}%) "
+                      f"using {combine_dd.value} of {len(rules)} rule(s)")
+                for k_name in (k for k in rois if k != 'combined'):
+                    n = int(rois[k_name].sum())
+                    pct = 100 * n / total_pixels
+                    print(f"    {k_name}: {n:,} pixels ({pct:.1f}%)")
+            except Exception as e:
+                print(f"Render failed: {e}")
+
+    # Wire up callbacks — every control re-renders
+    all_ctrls = [combine_dd, min_pix_slider, base_dd,
+                 base_channel_dd, base_num_dd, base_den_dd]
+    for r in (rule1, rule2):
+        all_ctrls.extend(r.values())
+    for ctrl in all_ctrls:
+        ctrl.observe(render, names='value')
+
+    # Initial render
+    render()
+
+    # Layout
+    rule1_box = W.VBox([
+        W.HBox([rule1['enable'], rule1['channel'], rule1['mode'],
+                rule1['comparison']]),
+        W.HBox([rule1['counts_cutoff'], rule1['percentile_cutoff'],
+                rule1['gmm_k'], rule1['gmm_component']]),
+    ], layout=W.Layout(border='1px solid #ddd', padding='6px',
+                       margin='2px 0'))
+    rule2_box = W.VBox([
+        W.HBox([rule2['enable'], rule2['channel'], rule2['mode'],
+                rule2['comparison']]),
+        W.HBox([rule2['counts_cutoff'], rule2['percentile_cutoff'],
+                rule2['gmm_k'], rule2['gmm_component']]),
+    ], layout=W.Layout(border='1px solid #ddd', padding='6px',
+                       margin='2px 0'))
+    combine_row = W.HBox([combine_dd, min_pix_slider])
+    base_row = W.HBox([base_dd, base_channel_dd, base_num_dd, base_den_dd])
+
+    display(W.VBox([rule1_box, rule2_box, combine_row, base_row, out]))
 
 
 def explore(img):

@@ -270,7 +270,7 @@ def plot_rule_masks(img, rois, base='channel', channel=None,
                     numerator=None, denominator=None,
                     cmap_base='viridis', show_individual=True,
                     contour_linewidth=1.4, panel_size=(5, 5),
-                    outpath=None, show=True):
+                    outpath=None, dpi=200, show=True):
     """
     Display rule-based ROI masks as outlined regions on a base image.
 
@@ -388,7 +388,7 @@ def plot_rule_masks(img, rois, base='channel', channel=None,
     fig.tight_layout()
 
     if outpath:
-        fig.savefig(outpath, dpi=200, bbox_inches='tight', facecolor='white')
+        fig.savefig(outpath, dpi=dpi, bbox_inches='tight', facecolor='white')
         print(f'Saved: {outpath}')
     if not show:
         plt.close(fig)

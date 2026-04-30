@@ -68,6 +68,12 @@ from pymims_histograms import _elbow_largest_drop, _elbow_kneedle
 
 FEATURE_SPACES = ('log_zscored', 'log_robustz', 'log', 'raw', 'ratios')
 
+# Track per-session which (image, exclusion-list) combinations have already
+# had their auto-exclusion message printed. Prevents the same message
+# spamming the notebook on every cluster_pixels call. Resets when the
+# kernel restarts.
+_SE_EXCLUSION_ANNOUNCED = set()
+
 
 # ── SE / topography channel detection ────────────────────────────────────────
 
@@ -583,7 +589,7 @@ def cluster_pixels(img, method='kmeans', k_max=10,
                    ratio_pairs=None,
                    min_counts=None, mask_channel=None, pixel_filter=None,
                    subsample_size=5000, linkage_method='ward',
-                   random_state=0):
+                   random_state=0, verbose=True):
     """
     Cluster the pixels of a NanoSIMS image.
 
@@ -650,6 +656,12 @@ def cluster_pixels(img, method='kmeans', k_max=10,
         features. Others: 'single', 'complete', 'average', 'centroid'.
     random_state : int, default 0
         Seed for k-means initialisation and hierarchical subsample.
+    verbose : bool, default True
+        If True, print informational messages such as the SE-channel
+        auto-exclusion notice. Messages are deduplicated within a
+        session — the SE-exclusion notice prints once per (image,
+        exclusion-list) combination, not on every call. Set False to
+        silence all informational output (errors are still raised).
 
     Returns
     -------
@@ -696,10 +708,15 @@ def cluster_pixels(img, method='kmeans', k_max=10,
                         if not _is_se_channel(img.masses[i])]
             excluded = [img.masses[i] for i in all_indices
                         if _is_se_channel(img.masses[i])]
-            if excluded:
-                print(f"Auto-excluded SE-like channel(s) from clustering: "
-                      f"{excluded}. Pass include_se=True to keep them, or "
-                      f"channels=[...] for explicit control.")
+            if excluded and verbose:
+                # Print only once per (image, exclusion-list) combination
+                # in a session — repeated calls on the same image stay quiet.
+                key = (id(img), tuple(excluded))
+                if key not in _SE_EXCLUSION_ANNOUNCED:
+                    print(f"Auto-excluded SE-like channel(s) from clustering: "
+                          f"{excluded}. Pass include_se=True to keep them, or "
+                          f"channels=[...] for explicit control.")
+                    _SE_EXCLUSION_ANNOUNCED.add(key)
 
     # Build full feature matrix
     X_full, feature_labels, (H, W) = _build_feature_array(

@@ -874,7 +874,7 @@ def _format_cophenetic_block(corr):
     return f'cophenetic corr = {corr:.3f}  ({band})\n{hint}'
 
 
-def plot_cluster_labels(img, result, k=None, cmap='tab10',
+def plot_cluster_labels(img, result, k=None, cmap=None,
                         outpath=None, show=True):
     """
     Display the labelled cluster image at a chosen k.
@@ -908,11 +908,9 @@ def plot_cluster_labels(img, result, k=None, cmap='tab10',
     )
 
     # Cluster label image
-    cmap_obj = plt.get_cmap(cmap)
     n_colours = max(k, 1)
-    # Build a discrete cmap with NaN handled as transparent
+    colors = _cluster_palette(n_colours, cmap=cmap)
     from matplotlib.colors import ListedColormap, BoundaryNorm
-    colors = [cmap_obj(i / max(n_colours - 1, 1)) for i in range(n_colours)]
     discrete = ListedColormap(colors)
     bounds = np.arange(0.5, n_colours + 1.5)
     norm = BoundaryNorm(bounds, discrete.N)
@@ -1004,21 +1002,68 @@ def plot_cluster_labels(img, result, k=None, cmap='tab10',
     return fig
 
 
-def _cluster_palette(n_clusters, cmap='tab10'):
-    """Build the same colour list used by plot_cluster_labels, so that
-    overlays/grid panels can match the legend."""
-    cmap_obj = plt.get_cmap(cmap)
-    n = max(n_clusters, 1)
-    return [cmap_obj(i / max(n - 1, 1)) for i in range(n)]
+# High-separation palette for the first six clusters. Hand-picked for
+# maximum perceptual distinguishability on both light and dark backgrounds:
+#   - hues span the wheel (red, green, blue, orange, magenta, yellow-green)
+#   - lightnesses alternate so adjacent indices contrast in brightness too
+#   - all colours readable on viridis, plasma, and dark HSI backgrounds
+HIGH_SEP_PALETTE = [
+    '#e41a1c',   # red
+    '#4daf4a',   # green
+    '#377eb8',   # blue
+    '#ff7f00',   # orange
+    '#f781bf',   # pink
+    '#ffff33',   # yellow
+]
 
 
-def _cluster_contours(label_image, cluster_id):
+def _cluster_palette(n_clusters, cmap=None):
+    """
+    Build a categorical colour list for cluster display.
+
+    The first six entries come from a hand-picked high-separation palette
+    (`HIGH_SEP_PALETTE`); subsequent entries fall back to matplotlib's
+    `tab10` for k > 6, then `tab20` for k > 10. The high-separation
+    palette is the default because tab10's blue/cyan are easily confused
+    on dark HSI backgrounds (where cluster outlines often need to be
+    distinguished against viridis-like base colours).
+
+    Pass cmap='tab10' to force the legacy palette.
+    """
+    if cmap is not None:
+        cmap_obj = plt.get_cmap(cmap)
+        n = max(n_clusters, 1)
+        return [cmap_obj(i / max(n - 1, 1)) for i in range(n)]
+
+    from matplotlib.colors import to_rgba
+    colours = [to_rgba(c) for c in HIGH_SEP_PALETTE]
+    if n_clusters <= len(colours):
+        return colours[:n_clusters]
+
+    # Long tail: append from tab10/tab20 for k > 6
+    extras_cmap = plt.get_cmap('tab10' if n_clusters <= 16 else 'tab20')
+    n_extra = n_clusters - len(colours)
+    extras = [extras_cmap(i / 9) for i in range(n_extra)]
+    return colours + extras
+
+
+def _cluster_contours(label_image, cluster_id, min_pixels=1):
     """
     Find sub-pixel contours of a single cluster within a 2-D label image.
     Uses scikit-image's marching-squares algorithm; returns a list of
     contour arrays, one per disconnected region.
 
     NaN-valued pixels (the masked-out regions) are treated as 'outside'.
+
+    Parameters
+    ----------
+    label_image : 2-D array of cluster IDs
+    cluster_id : int
+        Which cluster to extract contours for.
+    min_pixels : int, default 1
+        Drop connected components smaller than this many pixels before
+        contouring. Cuts visual noise from speckle-pattern clusters.
+        min_pixels=1 = no filtering.
     """
     try:
         from skimage import measure
@@ -1029,9 +1074,26 @@ def _cluster_contours(label_image, cluster_id):
             "(add --break-system-packages on Crostini)."
         )
     # Build a binary mask: 1 where this cluster, 0 elsewhere (incl. NaN).
-    mask = (label_image == cluster_id).astype(float)
+    mask = (label_image == cluster_id)
+
+    # Optional connected-component filtering: keep only components of
+    # size >= min_pixels. This dramatically cleans up overlays in cases
+    # where a single cluster appears as scattered single-pixel speckle.
+    if min_pixels > 1:
+        cc_labels = measure.label(mask, connectivity=2)   # 8-connectivity
+        if cc_labels.max() == 0:
+            return []
+        # Component-pixel counts; index 0 is background (mask=0)
+        sizes = np.bincount(cc_labels.ravel())
+        keep = sizes >= min_pixels
+        keep[0] = False    # background never kept
+        mask_filtered = keep[cc_labels]
+        if not mask_filtered.any():
+            return []
+        mask = mask_filtered
+
     # find_contours traces level=0.5 between 0 and 1 → cluster boundary.
-    contours = measure.find_contours(mask, 0.5)
+    contours = measure.find_contours(mask.astype(float), 0.5)
     return contours
 
 
@@ -1068,7 +1130,7 @@ def extract_cluster_masks(result, k=None):
     return {int(cid): (labels == cid) for cid in unique}
 
 
-def plot_cluster_grid(img, result, k_list=None, cmap='tab10',
+def plot_cluster_grid(img, result, k_list=None, cmap=None,
                       n_cols=None, panel_size=(4, 4),
                       outpath=None, show=True):
     """
@@ -1188,8 +1250,9 @@ def plot_cluster_grid(img, result, k_list=None, cmap='tab10',
 
 def plot_overlay(img, result, k=None, base='channel',
                  channel=None, numerator=None, denominator=None,
-                 cmap_base='viridis', cmap_clusters='tab10',
+                 cmap_base='viridis', cmap_clusters=None,
                  base_kwargs=None, contour_linewidth=1.4,
+                 min_pixels=1,
                  panel_size=(6, 6),
                  outpath=None, show=True):
     """
@@ -1228,6 +1291,11 @@ def plot_overlay(img, result, k=None, base='channel',
         or {'scale_factor': 10000, 'ratio_min': 37} for HSI).
     contour_linewidth : float
         Cluster outline thickness in points.
+    min_pixels : int, default 1
+        Filter out cluster regions smaller than this many connected pixels
+        before drawing contours. Set to ~10-20 to suppress single-pixel
+        speckle that adds visual noise without representing biological
+        structure. min_pixels=1 = no filtering (default).
     panel_size : (w, h) tuple
         Figure size in inches.
     outpath, show : as for other plot_* functions.
@@ -1376,7 +1444,7 @@ def plot_overlay(img, result, k=None, base='channel',
 
     legend_lines = []
     for cid in range(1, n_clusters + 1):
-        contours = _cluster_contours(labels, cid)
+        contours = _cluster_contours(labels, cid, min_pixels=min_pixels)
         if not contours:
             continue
         col = colors[cid - 1]

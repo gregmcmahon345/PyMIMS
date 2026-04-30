@@ -164,6 +164,133 @@ def run_analyses(img, specs):
 # Widget UI
 # ─────────────────────────────────────────────────────────────────────────────
 
+def cluster_overlay_slider(img, result):
+    """
+    Interactive cluster-overlay viewer with sliders for min_pixels and k.
+
+    Wraps `pymims_clustering.plot_overlay` in a widget UI. As the user
+    drags the min_pixels slider, the cluster outlines redraw with the new
+    speckle-filtering threshold. As the k dropdown changes, the cluster
+    partition switches.
+
+    Parameters
+    ----------
+    img : MimsImage
+    result : ClusterResult dict from cluster_pixels()
+
+    Usage
+    -----
+        from pymims_clustering import cluster_pixels
+        from pymims_explore import cluster_overlay_slider
+
+        result = cluster_pixels(img, method='kmeans', k_max=10)
+        cluster_overlay_slider(img, result)
+
+    Notes
+    -----
+    The widget renders a fresh figure on each control change. The
+    underlying clustering is not re-run; only the display is rebuilt,
+    so dragging the slider is fast (~0.5 s on a 256×256 image).
+    """
+    try:
+        import ipywidgets as W
+        from IPython.display import display, clear_output
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(f"Widget UI requires ipywidgets: {e}")
+
+    from pymims_clustering import plot_overlay
+
+    # Available k values come from result['labels_by_k']
+    k_options = sorted(result['labels_by_k'].keys())
+
+    # Build controls
+    k_dd = W.Dropdown(
+        options=k_options, value=result['sensible_k'],
+        description='k:',
+        layout=W.Layout(width='180px'),
+    )
+    base_dd = W.Dropdown(
+        options=['channel', 'ratio', 'delta', 'hsi'],
+        value='channel',
+        description='base:',
+        layout=W.Layout(width='180px'),
+    )
+    channel_dd = W.Dropdown(
+        options=img.masses, value=img.masses[0],
+        description='channel:',
+        layout=W.Layout(width='220px'),
+    )
+    num_dd = W.Dropdown(
+        options=img.masses, value=img.masses[0],
+        description='num:',
+        layout=W.Layout(width='200px'),
+    )
+    den_dd = W.Dropdown(
+        options=img.masses, value=img.masses[-1],
+        description='den:',
+        layout=W.Layout(width='200px'),
+    )
+    min_pix_slider = W.IntSlider(
+        value=1, min=1, max=200, step=1,
+        description='min pixels:',
+        style={'description_width': 'initial'},
+        continuous_update=False,    # only re-render on release, not while dragging
+        layout=W.Layout(width='400px'),
+    )
+    min_counts_input = W.FloatText(
+        value=0, description='min_counts:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='180px'),
+    )
+    out = W.Output()
+
+    def render(*_):
+        with out:
+            clear_output(wait=True)
+            base_kwargs = {}
+            if min_counts_input.value > 0:
+                base_kwargs['min_counts'] = min_counts_input.value
+
+            kwargs = dict(
+                img=img, result=result,
+                k=k_dd.value,
+                base=base_dd.value,
+                min_pixels=min_pix_slider.value,
+                base_kwargs=base_kwargs,
+                show=False,
+            )
+
+            if base_dd.value == 'channel':
+                kwargs['channel'] = channel_dd.value
+            else:
+                kwargs['numerator']   = num_dd.value
+                kwargs['denominator'] = den_dd.value
+
+            try:
+                fig = plot_overlay(**kwargs)
+                display(fig)
+                plt.close(fig)
+            except Exception as e:
+                print(f"Render failed: {e}")
+
+    # Wire up callbacks
+    for ctrl in (k_dd, base_dd, channel_dd, num_dd, den_dd,
+                 min_pix_slider, min_counts_input):
+        ctrl.observe(render, names='value')
+
+    # Initial render
+    render()
+
+    # Layout: controls in two rows above the output
+    controls = W.VBox([
+        W.HBox([k_dd, base_dd, channel_dd]),
+        W.HBox([num_dd, den_dd, min_counts_input]),
+        min_pix_slider,
+    ])
+    display(W.VBox([controls, out]))
+
+
 def explore(img):
     """
     Launch an ipywidgets UI for exploring ratios on a MimsImage.

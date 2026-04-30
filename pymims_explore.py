@@ -173,6 +173,15 @@ def cluster_overlay_slider(img, result):
     speckle-filtering threshold. As the k dropdown changes, the cluster
     partition switches.
 
+    Mode-specific controls auto-appear in the panel:
+      * For base='delta', set the δ reference (natural-abundance ratio,
+        auto-filled from ISOTOPE_REFS when num/den match a known pair)
+        and δ max (colour-bar limit in permil).
+      * For base='hsi', set the OpenMIMS-style scale factor (e.g. 10000
+        for ¹⁵N/¹⁴N), and optional hue min/max in scaled units.
+      * The min_counts field applies to all ratio-based modes (ratio,
+        delta, hsi) and masks out pixels with low denominator counts.
+
     Parameters
     ----------
     img : MimsImage
@@ -243,7 +252,46 @@ def cluster_overlay_slider(img, result):
         style={'description_width': 'initial'},
         layout=W.Layout(width='180px'),
     )
+    # Delta-mode controls (auto-fill from ISOTOPE_REFS when num/den match)
+    delta_ref_input = W.FloatText(
+        value=0.0,
+        description='δ ref:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='180px'),
+    )
+    delta_max_input = W.FloatText(
+        value=10000.0,
+        description='δ max (‰):',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='180px'),
+    )
+    # HSI-mode controls
+    scale_factor_input = W.FloatText(
+        value=1.0,
+        description='HSI scale ×:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='180px'),
+    )
+    ratio_min_input = W.Text(
+        value='', description='hue min:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='180px'),
+        placeholder='auto (1st pct)',
+    )
+    ratio_max_input = W.Text(
+        value='', description='hue max:',
+        style={'description_width': 'initial'},
+        layout=W.Layout(width='180px'),
+        placeholder='auto (99th pct)',
+    )
     out = W.Output()
+
+    def _autofill_delta_ref(*_):
+        """When num/den change, look up the natural-abundance value
+        from ISOTOPE_REFS and pre-fill δ ref."""
+        ref_val, _key = _lookup_ref(num_dd.value, den_dd.value)
+        if ref_val is not None:
+            delta_ref_input.value = ref_val
 
     def render(*_):
         with out:
@@ -251,6 +299,27 @@ def cluster_overlay_slider(img, result):
             base_kwargs = {}
             if min_counts_input.value > 0:
                 base_kwargs['min_counts'] = min_counts_input.value
+            if base_dd.value == 'delta':
+                if delta_ref_input.value <= 0:
+                    print("Render failed: 'δ ref' must be a positive value "
+                          "(natural-abundance ratio). For 15N/14N use 0.0037; "
+                          "for 13C/12C use 0.01124; etc.")
+                    return
+                base_kwargs['reference'] = delta_ref_input.value
+                base_kwargs['delta_max'] = delta_max_input.value
+            elif base_dd.value == 'hsi':
+                if scale_factor_input.value > 0:
+                    base_kwargs['scale_factor'] = scale_factor_input.value
+                if ratio_min_input.value.strip():
+                    try:
+                        base_kwargs['ratio_min'] = float(ratio_min_input.value)
+                    except ValueError:
+                        pass
+                if ratio_max_input.value.strip():
+                    try:
+                        base_kwargs['ratio_max'] = float(ratio_max_input.value)
+                    except ValueError:
+                        pass
 
             kwargs = dict(
                 img=img, result=result,
@@ -276,16 +345,25 @@ def cluster_overlay_slider(img, result):
 
     # Wire up callbacks
     for ctrl in (k_dd, base_dd, channel_dd, num_dd, den_dd,
-                 min_pix_slider, min_counts_input):
+                 min_pix_slider, min_counts_input,
+                 delta_ref_input, delta_max_input,
+                 scale_factor_input, ratio_min_input, ratio_max_input):
         ctrl.observe(render, names='value')
+    # Auto-fill δ ref when num/den change
+    for ctrl in (num_dd, den_dd):
+        ctrl.observe(_autofill_delta_ref, names='value')
+    # Initial auto-fill
+    _autofill_delta_ref()
 
     # Initial render
     render()
 
-    # Layout: controls in two rows above the output
+    # Layout: controls in three rows above the output
     controls = W.VBox([
         W.HBox([k_dd, base_dd, channel_dd]),
         W.HBox([num_dd, den_dd, min_counts_input]),
+        W.HBox([delta_ref_input, delta_max_input]),
+        W.HBox([scale_factor_input, ratio_min_input, ratio_max_input]),
         min_pix_slider,
     ])
     display(W.VBox([controls, out]))

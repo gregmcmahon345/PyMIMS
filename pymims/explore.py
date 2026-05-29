@@ -209,7 +209,7 @@ def cluster_overlay_slider(img, result):
     except ImportError as e:
         raise ImportError(f"Widget UI requires ipywidgets: {e}")
 
-    from pymims_clustering import plot_overlay
+    from .clustering import plot_overlay
 
     # Available k values come from result['labels_by_k']
     k_options = sorted(result['labels_by_k'].keys())
@@ -418,7 +418,7 @@ def roi_rule_slider(img, hist_results=None):
     except ImportError as e:
         raise ImportError(f"Widget UI requires ipywidgets: {e}")
 
-    from pymims_rules import build_roi_masks, plot_rule_masks
+    from .rules import build_roi_masks, plot_rule_masks
 
     has_gmm = hist_results is not None
     mode_options = ['counts', 'percentile']

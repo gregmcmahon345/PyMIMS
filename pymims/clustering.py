@@ -63,7 +63,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Import shared elbow heuristics from the histograms module
-from pymims_histograms import _elbow_largest_drop, _elbow_kneedle
+from .histograms import _elbow_largest_drop, _elbow_kneedle
 
 
 FEATURE_SPACES = ('log_zscored', 'log_robustz', 'log', 'raw', 'ratios')
